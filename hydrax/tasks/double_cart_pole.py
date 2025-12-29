@@ -2,20 +2,29 @@ import jax
 import jax.numpy as jnp
 import mujoco
 from mujoco import mjx
+from typing import TYPE_CHECKING
 
 from hydrax import ROOT
 from hydrax.task_base import Task
+
+if TYPE_CHECKING:
+    from hydrax.dynamics_base import DynamicsModel
 
 
 class DoubleCartPole(Task):
     """A swing-up task for a double pendulum on a cart."""
 
-    def __init__(self) -> None:
-        """Load the MuJoCo model and set task parameters."""
+    def __init__(self, custom_dynamics: "DynamicsModel | None" = None) -> None:
+        """Load the MuJoCo model and set task parameters.
+
+        Args:
+            custom_dynamics: Optional custom dynamics model to use for rollouts
+                           instead of the default MJX physics simulator.
+        """
         mj_model = mujoco.MjModel.from_xml_path(
             ROOT + "/models/double_cart_pole/scene.xml"
         )
-        super().__init__(mj_model, trace_sites=["tip"])
+        super().__init__(mj_model, trace_sites=["tip"], custom_dynamics=custom_dynamics)
         self.tip_id = mj_model.site("tip").id
 
     def _distance_to_upright(self, state: mjx.Data) -> jax.Array:

@@ -244,18 +244,45 @@ class SamplingBasedController(ABC):
             A Trajectory object containing the control, costs, and trace sites.
         """
 
-        def _scan_fn(
-            x: mjx.Data, u: jax.Array
-        ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array]]:
-            """Compute the cost and observation, then advance the state."""
-            x = x.replace(ctrl=u)
-            x = mjx.step(model, x)  # step model + compute site positions
-            cost = self.dt * self.task.running_cost(x, u)
-            sites = self.task.get_trace_sites(x)
-            return x, (x, cost, sites)
+        # Check if we're using custom dynamics
+        use_custom_dynamics = self.task.custom_dynamics is not None
 
-        final_state, (states, costs, trace_sites) = jax.lax.scan(
-            _scan_fn, state, controls
+        if use_custom_dynamics:
+            # Initialize state history for models that need it (e.g., GRU)
+            state_history = self.task.custom_dynamics.initialize_state_history(
+                model, state
+            )
+
+        def _scan_fn(
+            carry: Tuple[mjx.Data, jax.Array | None], u: jax.Array
+        ) -> Tuple[Tuple[mjx.Data, jax.Array | None], Tuple[mjx.Data, jax.Array, jax.Array]]:
+            """Compute the cost and observation, then advance the state."""
+            x, history = carry
+            x = x.replace(ctrl=u)
+
+            if use_custom_dynamics:
+                # Use custom dynamics model
+                result = self.task.custom_dynamics.step(model, x, history)
+                # Handle different return types from custom dynamics
+                if isinstance(result, tuple):
+                    # Neural network dynamics returns (next_state, updated_history, gru_state)
+                    x_next = result[0]
+                    history = result[1] if len(result) > 1 else history
+                else:
+                    # Deterministic dynamics returns just next_state
+                    x_next = result
+            else:
+                # Use default MJX dynamics
+                x_next = mjx.step(model, x)
+
+            cost = self.dt * self.task.running_cost(x_next, u)
+            sites = self.task.get_trace_sites(x_next)
+            return (x_next, history), (x_next, cost, sites)
+
+        # Initial carry includes state and history
+        initial_carry = (state, state_history if use_custom_dynamics else None)
+        (final_state, _), (states, costs, trace_sites) = jax.lax.scan(
+            _scan_fn, initial_carry, controls
         )
         final_cost = self.task.terminal_cost(final_state)
         final_trace_sites = self.task.get_trace_sites(final_state)

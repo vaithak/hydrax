@@ -1,10 +1,13 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Sequence
+from typing import Dict, Sequence, TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import mujoco
 from mujoco import mjx
+
+if TYPE_CHECKING:
+    from hydrax.dynamics_base import DynamicsModel
 
 
 class Task(ABC):
@@ -15,20 +18,25 @@ class Task(ABC):
         minᵤ ϕ(x_{T+1}) + ∑ₜ ℓ(xₜ, uₜ)
         s.t. xₜ₊₁ = f(xₜ, uₜ)
 
-    where the dynamics f(xₜ, uₜ) are defined by a MuJoCo model, and the costs
-    ℓ(xₜ, uₜ) and ϕ(x_{T+1}) are defined by the task instance itself.
+    where the dynamics f(xₜ, uₜ) are defined by a MuJoCo model (or a custom
+    dynamics model), and the costs ℓ(xₜ, uₜ) and ϕ(x_{T+1}) are defined by
+    the task instance itself.
     """
 
     def __init__(
         self,
         mj_model: mujoco.MjModel,
         trace_sites: Sequence[str] | None = None,
+        custom_dynamics: "DynamicsModel | None" = None,
     ) -> None:
         """Set the model and simulation parameters.
 
         Args:
             mj_model: The MuJoCo model to use for simulation.
             trace_sites: A list of site names to visualize with traces.
+            custom_dynamics: Optional custom dynamics model to use for rollouts
+                           instead of the default MJX physics simulator.
+                           If None, uses standard MJX dynamics.
 
         Note: many other simulator parameters, e.g., simulator time step,
               Newton iterations, etc., are set in the model itself.
@@ -36,6 +44,7 @@ class Task(ABC):
         assert isinstance(mj_model, mujoco.MjModel)
         self.mj_model = mj_model
         self.model = mjx.put_model(mj_model)
+        self.custom_dynamics = custom_dynamics
 
         # Set actuator limits
         self.u_min = jnp.where(
