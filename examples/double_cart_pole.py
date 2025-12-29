@@ -3,11 +3,8 @@ import mujoco
 from hydrax.algs import PredictiveSampling, MPPI
 from hydrax.simulation.deterministic import run_interactive
 from hydrax.tasks.double_cart_pole import DoubleCartPole
-from hydrax.dynamics import (
-    NeuralNetworkDynamics,
-    SimplifiedPhysicsDynamics,
-    DoubleCartPoleDynamics,
-)
+from hydrax.dynamics import NeuralNetworkDynamics
+
 import argparse
 
 """
@@ -29,9 +26,9 @@ subparsers.add_parser("mppi", help="Model Predictive Path Integral Control")
 parser.add_argument(
     "--dynamics",
     type=str,
-    choices=["none", "nn", "deterministic"],
+    choices=["none", "nn"],
     default="none",
-    help="Dynamics model to use for rollouts: 'none' (default MJX), 'nn' (neural network GRU), 'deterministic' (simplified physics)",
+    help="Dynamics model to use for rollouts: 'none' (default MJX), 'nn' (neural network GRU)",
 )
 
 args = parser.parse_args()
@@ -48,18 +45,6 @@ if args.dynamics == "nn":
         model=base_task.model,
         hidden_size=128,
         history_length=11,
-    )
-elif args.dynamics == "deterministic":
-    print("Using Deterministic simplified physics dynamics for rollouts")
-    custom_dynamics = DoubleCartPoleDynamics(
-        model=base_task.model,
-        integration_method="rk4",
-        cart_mass=1.0,
-        pole1_mass=0.1,
-        pole2_mass=0.1,
-        pole1_length=0.5,
-        pole2_length=0.5,
-        gravity=9.81,
     )
 else:
     print("Using default MJX dynamics for rollouts")

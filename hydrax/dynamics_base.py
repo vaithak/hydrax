@@ -21,7 +21,6 @@ class DynamicsModel(ABC):
 
     Custom dynamics models can be:
     - Learned neural network models (e.g., GRU-based predictors)
-    - Simplified analytical physics models
     - Hybrid models combining learned and analytical components
     """
 
