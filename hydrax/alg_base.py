@@ -13,6 +13,21 @@ from hydrax.utils.spline import get_interp_func
 
 
 @dataclass
+class DynamicsState:
+    """State buffer for custom dynamics models that require history.
+
+    This class maintains the state-action history buffer that persists
+    across MPC iterations and gets updated with real executed actions.
+
+    Attributes:
+        history: History of (state, action) pairs, shape (history_length, state_action_dim).
+                 None if no custom dynamics or dynamics doesn't need history.
+    """
+
+    history: jax.Array | None = None
+
+
+@dataclass
 class Trajectory:
     """Data class for storing rollout data.
 
@@ -123,12 +138,15 @@ class SamplingBasedController(ABC):
                 {key: 0 for key in randomizations.keys()}
             )
 
-    def optimize(self, state: mjx.Data, params: Any) -> Tuple[Any, Trajectory]:
+    def optimize(
+        self, state: mjx.Data, params: Any, dynamics_state: DynamicsState | None = None
+    ) -> Tuple[Any, Trajectory]:
         """Perform an optimization step to update the policy parameters.
 
         Args:
             state: The initial state x₀.
             params: The current policy parameters, U ~ π(params).
+            dynamics_state: Optional state for custom dynamics (contains history buffer).
 
         Returns:
             Updated policy parameters
@@ -154,7 +172,7 @@ class SamplingBasedController(ABC):
             # combining costs using self.risk_strategy.
             rng, dr_rng = jax.random.split(params.rng)
             rollouts = self.rollout_with_randomizations(
-                state, new_tk, knots, dr_rng
+                state, new_tk, knots, dr_rng, dynamics_state
             )
             params = params.replace(rng=rng)
 
@@ -177,6 +195,7 @@ class SamplingBasedController(ABC):
         tk: jax.Array,
         knots: jax.Array,
         rng: jax.Array,
+        dynamics_state: DynamicsState | None = None,
     ) -> Trajectory:
         """Compute rollout costs, applying domain randomizations.
 
@@ -185,6 +204,7 @@ class SamplingBasedController(ABC):
             tk: The knot times of the control spline, (num_knots,).
             knots: The control spline knots, (num rollouts, num_knots, nu).
             rng: The random number generator key for randomizing initial states.
+            dynamics_state: Optional state for custom dynamics (contains history buffer).
 
         Returns:
             A Trajectory object containing the control, costs, and trace sites.
@@ -210,8 +230,8 @@ class SamplingBasedController(ABC):
         # Apply the control sequences, parallelized over both rollouts and
         # domain randomizations.
         _, rollouts = jax.vmap(
-            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None)
-        )(self.model, states, controls, knots)
+            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None, None)
+        )(self.model, states, controls, knots, dynamics_state)
 
         # Combine the costs from different domain randomizations using the
         # specified risk strategy.
@@ -223,13 +243,14 @@ class SamplingBasedController(ABC):
             costs=costs, controls=controls, knots=knots, trace_sites=trace_sites
         )
 
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0))
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None))
     def eval_rollouts(
         self,
         model: mjx.Model,
         state: mjx.Data,
         controls: jax.Array,
         knots: jax.Array,
+        dynamics_state: DynamicsState | None = None,
     ) -> Tuple[mjx.Data, Trajectory]:
         """Rollout control sequences (in parallel) and compute the costs.
 
@@ -238,6 +259,8 @@ class SamplingBasedController(ABC):
             state: The initial state x₀.
             controls: The control sequences, (num rollouts, H, nu).
             knots: The control spline knots, (num rollouts, num_knots, nu).
+            dynamics_state: Optional state for custom dynamics (contains history buffer).
+                          Required if using custom dynamics, None otherwise.
 
         Returns:
             The states (stacked) experienced during the rollouts.
@@ -248,10 +271,12 @@ class SamplingBasedController(ABC):
         use_custom_dynamics = self.task.custom_dynamics is not None
 
         if use_custom_dynamics:
-            # Initialize state history for models that need it (e.g., GRU)
-            state_history = self.task.custom_dynamics.initialize_state_history(
-                model, state
+            # Ensure dynamics_state is provided when using custom dynamics
+            assert dynamics_state is not None, (
+                "dynamics_state must be provided when using custom dynamics"
             )
+            # Use the real history from dynamics_state
+            state_history = dynamics_state.history
 
         def _scan_fn(
             carry: Tuple[mjx.Data, jax.Array | None], u: jax.Array
@@ -320,6 +345,44 @@ class SamplingBasedController(ABC):
         )
         tk = jnp.linspace(0.0, self.plan_horizon, self.num_knots)
         return SamplingParams(tk=tk, mean=mean, rng=rng)
+
+    def init_dynamics_state(self, state: mjx.Data) -> DynamicsState:
+        """Initialize the dynamics state for custom dynamics models.
+
+        Args:
+            state: The initial state x₀.
+
+        Returns:
+            Initialized DynamicsState with history buffer (or None if no custom dynamics).
+        """
+        if self.task.custom_dynamics is not None:
+            history = self.task.custom_dynamics.initialize_state_history(
+                self.task.model, state
+            )
+            return DynamicsState(history=history)
+        else:
+            return DynamicsState(history=None)
+
+    def update_dynamics_state(
+        self, dynamics_state: DynamicsState, state: mjx.Data, control: jax.Array
+    ) -> DynamicsState:
+        """Update the dynamics state with a real executed state-action pair.
+
+        Args:
+            dynamics_state: Current dynamics state.
+            state: The executed state.
+            control: The executed control action.
+
+        Returns:
+            Updated DynamicsState with the new state-action pair added to history.
+        """
+        if self.task.custom_dynamics is not None and dynamics_state.history is not None:
+            updated_history = self.task.custom_dynamics.update_state_history(
+                dynamics_state.history, state, control
+            )
+            return DynamicsState(history=updated_history)
+        else:
+            return dynamics_state
 
     @abstractmethod
     def sample_knots(self, params: Any) -> Tuple[jax.Array, Any]:
