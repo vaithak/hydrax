@@ -225,14 +225,16 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):
                 mj_data.ctrl[:] = np.array(us[i])
+
+                # Update dynamics state with the state-action pair BEFORE stepping
+                # This maintains consistency with how history is updated during rollouts
+                mjx_data_before = mjx.put_data(mj_model, mj_data)
+                dynamics_state = controller.update_dynamics_state(
+                    dynamics_state, mjx_data_before, jnp.array(us[i])
+                )
+
                 mujoco.mj_step(mj_model, mj_data)
                 viewer.sync()
-
-                # Update dynamics state with the real executed state-action pair
-                mjx_data_step = mjx.put_data(mj_model, mj_data)
-                dynamics_state = controller.update_dynamics_state(
-                    dynamics_state, mjx_data_step, jnp.array(us[i])
-                )
 
                 # Capture frame if recording
                 if record_video and recorder.is_recording:

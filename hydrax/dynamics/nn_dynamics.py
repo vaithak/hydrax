@@ -141,7 +141,7 @@ class NeuralNetworkDynamics(DynamicsModel):
         model: mjx.Model,
         data: mjx.Data,
         state_history: jax.Array | None = None,
-    ) -> Tuple[mjx.Data, jax.Array, jax.Array]:
+    ) -> Tuple[mjx.Data, jax.Array]:
         """Advance the state using the learned GRU dynamics model.
 
         Args:
@@ -151,13 +151,13 @@ class NeuralNetworkDynamics(DynamicsModel):
 
         Returns:
             next_data: Updated state
-            updated_history: Updated state-action history
-            updated_gru_state: Updated GRU hidden state
+            updated_history: Updated state-action history (needed for autoregressive rollouts)
         """
         if state_history is None:
             state_history = self.initialize_state_history(model, data)
 
         # Update history with current state and action
+        # This is needed for autoregressive rollouts in controller.optimize()
         current_state_action = jnp.concatenate([data.qpos, data.qvel, data.ctrl])
         updated_history = jnp.roll(state_history, shift=-1, axis=0)
         updated_history = updated_history.at[-1].set(current_state_action)
@@ -167,7 +167,7 @@ class NeuralNetworkDynamics(DynamicsModel):
         # The GRU processes the 11-step history internally, but we don't carry
         # the final GRU state between different predictions
         initial_gru_state = jnp.zeros((self.hidden_size,))
-        delta, new_gru_state = self.network(updated_history, initial_gru_state)
+        delta, _ = self.network(updated_history, initial_gru_state)
 
         # Split delta into qpos and qvel components
         nq = model.nq
@@ -185,9 +185,7 @@ class NeuralNetworkDynamics(DynamicsModel):
             time=data.time + model.opt.timestep,
         )
 
-        # Note: new_gru_state is returned but typically discarded by the caller
-        # Each prediction starts fresh; GRU state is not carried between predictions
-        return next_data, updated_history, new_gru_state
+        return next_data, updated_history
 
     def get_config(self) -> Dict[str, Any]:
         """Return configuration dictionary."""
