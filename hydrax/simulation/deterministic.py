@@ -85,14 +85,15 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         mocap_pos=mj_data.mocap_pos, mocap_quat=mj_data.mocap_quat
     )
     policy_params = controller.init_params(initial_knots=initial_knots)
+    dynamics_state = controller.init_dynamics_state(mjx_data)
     jit_optimize = jax.jit(controller.optimize)
     jit_interp_func = jax.jit(controller.interp_func)
 
     # Warm-up the controller
     print("Jitting the controller...")
     st = time.time()
-    policy_params, rollouts = jit_optimize(mjx_data, policy_params)
-    policy_params, rollouts = jit_optimize(mjx_data, policy_params)
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, dynamics_state)
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, dynamics_state)
 
     tq = jnp.arange(0, sim_steps_per_replan) * mj_model.opt.timestep
     tk = policy_params.tk
@@ -176,7 +177,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             # Do a replanning step
             plan_start = time.time()
-            policy_params, rollouts = jit_optimize(mjx_data, policy_params)
+            policy_params, rollouts = jit_optimize(mjx_data, policy_params, dynamics_state)
             plan_time = time.time() - plan_start
 
             # Visualize the rollouts
@@ -224,6 +225,14 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):
                 mj_data.ctrl[:] = np.array(us[i])
+
+                # Update dynamics state with the state-action pair BEFORE stepping
+                # This maintains consistency with how history is updated during rollouts
+                mjx_data_before = mjx.put_data(mj_model, mj_data)
+                dynamics_state = controller.update_dynamics_state(
+                    dynamics_state, mjx_data_before, jnp.array(us[i])
+                )
+
                 mujoco.mj_step(mj_model, mj_data)
                 viewer.sync()
 
