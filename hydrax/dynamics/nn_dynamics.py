@@ -63,7 +63,7 @@ class GRUDynamicsNetwork(nnx.Module):
         # Process each timestep in the history through GRU
         carry = gru_state
         for t in range(state_action_history.shape[0]):
-            carry = self.gru_cell(state_action_history[t], carry)
+            carry, _ = self.gru_cell(carry, state_action_history[t])
 
         # Output layer to predict state delta
         delta = self.output_dense(carry)
