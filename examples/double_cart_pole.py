@@ -6,6 +6,7 @@ from hydrax.tasks.double_cart_pole import DoubleCartPole
 from hydrax.dynamics import NeuralNetworkDynamics
 
 import argparse
+import jax.numpy as jnp
 
 """
 Run an interactive simulation of a double pendulum on a cart. Only the cart
@@ -41,10 +42,17 @@ base_task = DoubleCartPole()
 custom_dynamics = None
 if args.dynamics == "nn":
     print("Using Neural Network (GRU) dynamics for rollouts")
+    # For double cart pole:
+    # qpos[0]: cart position (coordinate)
+    # qpos[1]: pole 1 angle
+    # qpos[2]: pole 2 angle
+    # So we normalize cart position (index 0) and convert angles (indices 1, 2) to (cos, sin)
     custom_dynamics = NeuralNetworkDynamics(
         model=base_task.model,
         hidden_size=128,
         history_length=11,
+        coordinate_indices=jnp.array([0]),
+        angle_indices=jnp.array([1, 2]),
     )
 else:
     print("Using default MJX dynamics for rollouts")

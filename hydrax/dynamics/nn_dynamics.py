@@ -2,6 +2,12 @@
 
 This module implements a learned dynamics model that uses a GRU (Gated Recurrent Unit)
 to predict the next state based on a history of (state, action) pairs.
+
+The model supports:
+- Coordinate normalization: Cartesian coordinates are normalized relative to the first
+  point in history when passed to the network (but stored unnormalized in history)
+- Angle representation: Angles are converted to (cos, sin) in history and the network
+  predicts (cos(delta), sin(delta)) for updates
 """
 
 from typing import Any, Dict, Tuple
@@ -76,6 +82,9 @@ class NeuralNetworkDynamics(DynamicsModel):
 
     This model maintains a history of the past 11 (state, action) pairs
     and uses a GRU to predict the next state autoregressively.
+
+    Supports coordinate normalization and angle representation for better
+    neural network performance.
     """
 
     def __init__(
@@ -86,6 +95,8 @@ class NeuralNetworkDynamics(DynamicsModel):
         network: GRUDynamicsNetwork | None = None,
         model_path: str | None = None,
         seed: int = 0,
+        coordinate_indices: jax.Array | None = None,
+        angle_indices: jax.Array | None = None,
     ):
         """Initialize the neural network dynamics model.
 
@@ -96,12 +107,32 @@ class NeuralNetworkDynamics(DynamicsModel):
             network: Pre-initialized GRU network (if available)
             model_path: Path to saved model parameters (if available)
             seed: Random seed for initialization
+            coordinate_indices: Indices in qpos for Cartesian coordinates (for normalization)
+            angle_indices: Indices in qpos for angles (converted to cos/sin)
         """
         self.model_ref = model
         self.hidden_size = hidden_size
         self.history_length = history_length
-        self.state_dim = model.nq + model.nv
         self.action_dim = model.nu
+
+        # Store indices for state transformations
+        self.coordinate_indices = coordinate_indices if coordinate_indices is not None else jnp.array([])
+        self.angle_indices = angle_indices if angle_indices is not None else jnp.array([])
+
+        # Pre-sort angle indices and convert to Python list for iteration
+        # This avoids JAX tracing issues when iterating over angle indices
+        if len(self.angle_indices) > 0:
+            self.sorted_angle_indices = [int(idx) for idx in jnp.sort(self.angle_indices)]
+        else:
+            self.sorted_angle_indices = []
+
+        # Calculate transformed state dimension
+        # Each angle becomes 2 values (cos, sin), other positions stay the same
+        nq = model.nq
+        nv = model.nv
+        num_angles = len(self.angle_indices)
+        self.transformed_qpos_dim = nq + num_angles  # nq positions + num_angles extra for cos/sin
+        self.state_dim = self.transformed_qpos_dim + nv  # transformed qpos + qvel
 
         # Initialize or load the network
         if network is None:
@@ -119,6 +150,82 @@ class NeuralNetworkDynamics(DynamicsModel):
         else:
             self.network = network
 
+        # Precompute transformed coordinate indices for efficiency
+        self.transformed_coord_indices = self._compute_transformed_coord_indices()
+
+        # Convert to Python list for iteration to avoid JAX tracing issues
+        if len(self.transformed_coord_indices) > 0:
+            self.transformed_coord_indices_list = [int(idx) for idx in self.transformed_coord_indices]
+        else:
+            self.transformed_coord_indices_list = []
+
+    def _compute_transformed_coord_indices(self) -> jax.Array:
+        """Compute coordinate indices after angle expansion."""
+        if len(self.coordinate_indices) == 0:
+            return jnp.array([])
+
+        transformed_indices = []
+        for coord_idx in self.coordinate_indices:
+            # Each angle before this index adds one extra dimension
+            num_angles_before = jnp.sum(self.angle_indices < coord_idx)
+            transformed_idx = coord_idx + num_angles_before
+            transformed_indices.append(transformed_idx)
+
+        return jnp.array(transformed_indices)
+
+    def _transform_qpos_to_nn_format(self, qpos: jax.Array) -> jax.Array:
+        """Transform qpos to neural network format (angles -> cos/sin).
+
+        Args:
+            qpos: Original qpos array
+
+        Returns:
+            Transformed qpos with angles expanded to (cos, sin)
+        """
+        if len(self.sorted_angle_indices) == 0:
+            return qpos
+
+        # Build transformed array by processing segments between angles
+        parts = []
+        prev_idx = 0
+
+        # Iterate over pre-sorted Python list to avoid JAX tracing issues
+        for angle_idx in self.sorted_angle_indices:
+            # Add regular values before this angle
+            if angle_idx > prev_idx:
+                parts.append(qpos[prev_idx:angle_idx])
+            # Add cos/sin for the angle
+            parts.append(jnp.array([jnp.cos(qpos[angle_idx]), jnp.sin(qpos[angle_idx])]))
+            prev_idx = angle_idx + 1
+
+        # Add any remaining regular values
+        if prev_idx < len(qpos):
+            parts.append(qpos[prev_idx:])
+
+        return jnp.concatenate(parts)
+
+    def _normalize_coordinates(self, history: jax.Array) -> jax.Array:
+        """Normalize coordinates relative to first timestep (for network input only).
+
+        Args:
+            history: State-action history with transformed qpos
+
+        Returns:
+            History with normalized coordinates
+        """
+        if len(self.transformed_coord_indices_list) == 0:
+            return history
+
+        # Subtract first frame's coordinate values from all frames
+        reference_qpos = history[0, :self.transformed_qpos_dim]
+        normalized = history.copy()
+
+        # Use pre-converted Python list to avoid JAX tracing issues
+        for idx in self.transformed_coord_indices_list:
+            normalized = normalized.at[:, idx].add(-reference_qpos[idx])
+
+        return normalized
+
     def initialize_state_history(
         self, model: mjx.Model, data: mjx.Data | None = None
     ) -> jax.Array:
@@ -129,12 +236,83 @@ class NeuralNetworkDynamics(DynamicsModel):
             data: The current state (optional)
 
         Returns:
-            Initialized history buffer of shape (history_length, state_action_dim)
+            Initialized history buffer of shape (history_length, transformed_state_dim + action_dim)
         """
-        state_dim = model.nq + model.nv
         action_dim = model.nu
-        history_dim = state_dim + action_dim
+        history_dim = self.state_dim + action_dim
         return jnp.zeros((self.history_length, history_dim))
+
+    def _update_qpos_from_delta(
+        self, current_qpos: jax.Array, delta: jax.Array
+    ) -> jax.Array:
+        """Update qpos from predicted delta, handling angle updates properly.
+
+        For angles: network predicts (cos(delta), sin(delta)). We extract the
+        delta angle using arctan2, add it to the current angle, and normalize
+        to [-pi, pi] range.
+
+        Args:
+            current_qpos: Original qpos (not transformed)
+            delta: Predicted delta from network (in transformed space)
+
+        Returns:
+            Updated qpos in original space
+        """
+        if len(self.sorted_angle_indices) == 0:
+            # No angles, simple addition
+            return current_qpos + delta
+
+        # Build updated qpos by processing each segment
+        new_qpos = current_qpos.copy()
+        transformed_idx = 0
+        original_idx = 0
+
+        # Use pre-sorted Python list to avoid JAX tracing issues
+        for angle_idx in self.sorted_angle_indices:
+
+            # Skip to this angle in the transformed space
+            segment_length = angle_idx - original_idx
+            transformed_idx += segment_length
+
+            # Update regular positions before this angle
+            if segment_length > 0:
+                new_qpos = new_qpos.at[original_idx:angle_idx].add(
+                    delta[transformed_idx - segment_length:transformed_idx]
+                )
+
+            # Update the angle
+            # Delta is (cos(δ), sin(δ)) - extract angle delta using arctan2
+            cos_delta = delta[transformed_idx]
+            sin_delta = delta[transformed_idx + 1]
+            angle_delta = jnp.arctan2(sin_delta, cos_delta)
+
+            # Add delta to current angle and normalize to [-pi, pi]
+            new_angle = current_qpos[angle_idx] + angle_delta
+            # Normalize to [-pi, pi] range
+            new_angle = jnp.arctan2(jnp.sin(new_angle), jnp.cos(new_angle))
+            new_qpos = new_qpos.at[angle_idx].set(new_angle)
+
+            transformed_idx += 2  # Skip the cos/sin pair
+            original_idx = angle_idx + 1
+
+        # Handle remaining positions after last angle
+        if original_idx < len(current_qpos):
+            remaining_length = len(current_qpos) - original_idx
+            new_qpos = new_qpos.at[original_idx:].add(delta[transformed_idx:transformed_idx + remaining_length])
+
+        return new_qpos
+
+    def transform_state(self, data: mjx.Data) -> jax.Array:
+        """Transform state to NN format (angles -> cos/sin).
+
+        Args:
+            data: Current state
+
+        Returns:
+            Transformed state with angles expanded to (cos, sin) pairs
+        """
+        transformed_qpos = self._transform_qpos_to_nn_format(data.qpos)
+        return jnp.concatenate([transformed_qpos, data.qvel])
 
     def step(
         self,
@@ -147,7 +325,7 @@ class NeuralNetworkDynamics(DynamicsModel):
         Args:
             model: The MJX model
             data: Current state (with control in data.ctrl)
-            state_history: History of (state, action) pairs
+            state_history: History of (state, action) pairs (stores transformed states)
 
         Returns:
             next_data: Updated state
@@ -156,26 +334,25 @@ class NeuralNetworkDynamics(DynamicsModel):
         if state_history is None:
             state_history = self.initialize_state_history(model, data)
 
-        # Update history with current state and action
-        # This is needed for autoregressive rollouts in controller.optimize()
-        current_state_action = jnp.concatenate([data.qpos, data.qvel, data.ctrl])
-        updated_history = jnp.roll(state_history, shift=-1, axis=0)
-        updated_history = updated_history.at[-1].set(current_state_action)
+        # Update history with current state and action using base class method
+        # This automatically uses transform_state to get the correct format
+        updated_history = self.update_state_history(state_history, data, data.ctrl)
+
+        # Normalize coordinates for network input (only positions, not velocities)
+        normalized_history = self._normalize_coordinates(updated_history)
 
         # Predict state delta using NNX
-        # Always start with zero GRU state - each prediction is independent
-        # The GRU processes the 11-step history internally, but we don't carry
-        # the final GRU state between different predictions
         initial_gru_state = jnp.zeros((self.hidden_size,))
-        delta, _ = self.network(updated_history, initial_gru_state)
+        delta, _ = self.network(normalized_history, initial_gru_state)
 
         # Split delta into qpos and qvel components
-        nq = model.nq
-        delta_qpos = delta[:nq]
-        delta_qvel = delta[nq:]
+        delta_qpos = delta[:self.transformed_qpos_dim]
+        delta_qvel = delta[self.transformed_qpos_dim:]
 
-        # Update state
-        new_qpos = data.qpos + delta_qpos
+        # Update qpos (handling angles with arctan2 and normalization)
+        new_qpos = self._update_qpos_from_delta(data.qpos, delta_qpos)
+
+        # Update qvel (simple addition)
         new_qvel = data.qvel + delta_qvel
 
         # Create new data object with updated state
@@ -195,6 +372,8 @@ class NeuralNetworkDynamics(DynamicsModel):
             "history_length": self.history_length,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
+            "coordinate_indices": self.coordinate_indices,
+            "angle_indices": self.angle_indices,
         }
 
     def save_params(self, path: str):
@@ -246,6 +425,8 @@ class NeuralNetworkDynamics(DynamicsModel):
             hidden_size=config["hidden_size"],
             history_length=config["history_length"],
             network=network,
+            coordinate_indices=config.get("coordinate_indices"),
+            angle_indices=config.get("angle_indices"),
         )
 
         return dynamics
