@@ -49,6 +49,22 @@ class DynamicsModel(ABC):
         """
         pass
 
+    def transform_state(self, data: mjx.Data) -> jax.Array:
+        """Transform state to the representation used by this dynamics model.
+
+        This allows custom dynamics models to use different state representations
+        internally (e.g., converting angles to cos/sin, normalizing coordinates).
+        The default implementation simply concatenates qpos and qvel.
+
+        Args:
+            data: Current state
+
+        Returns:
+            Transformed state array in the format expected by this model
+        """
+        # Default implementation: just concatenate qpos and qvel
+        return jnp.concatenate([data.qpos, data.qvel])
+
     def initialize_state_history(
         self, model: mjx.Model, data: mjx.Data | None = None
     ) -> jax.Array:
@@ -78,6 +94,7 @@ class DynamicsModel(ABC):
         """Update the state-action history with the current step.
 
         Implements a sliding window: drops oldest entry and appends current.
+        Uses transform_state to ensure the state is in the correct format.
 
         Args:
             state_history: Current history buffer, shape (history_length, dim)
@@ -87,8 +104,9 @@ class DynamicsModel(ABC):
         Returns:
             Updated history buffer with the same shape
         """
-        # Concatenate current state and action
-        state_action = jnp.concatenate([data.qpos, data.qvel, control])
+        # Transform state and concatenate with action
+        transformed_state = self.transform_state(data)
+        state_action = jnp.concatenate([transformed_state, control])
         # Shift history and append new entry
         updated_history = jnp.roll(state_history, shift=-1, axis=0)
         updated_history = updated_history.at[-1].set(state_action)

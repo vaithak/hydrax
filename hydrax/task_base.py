@@ -28,6 +28,8 @@ class Task(ABC):
         mj_model: mujoco.MjModel,
         trace_sites: Sequence[str] | None = None,
         custom_dynamics: "DynamicsModel | None" = None,
+        coordinate_indices: Sequence[int] | None = None,
+        angle_indices: Sequence[int] | None = None,
     ) -> None:
         """Set the model and simulation parameters.
 
@@ -37,6 +39,11 @@ class Task(ABC):
             custom_dynamics: Optional custom dynamics model to use for rollouts
                            instead of the default MJX physics simulator.
                            If None, uses standard MJX dynamics.
+            coordinate_indices: Indices in qpos that represent Cartesian coordinates
+                              that should be normalized (first point in history as origin).
+                              Only positions are normalized, not velocities.
+            angle_indices: Indices in qpos that represent angles that should be
+                          converted to (cos, sin) representation for the neural network.
 
         Note: many other simulator parameters, e.g., simulator time step,
               Newton iterations, etc., are set in the model itself.
@@ -45,6 +52,10 @@ class Task(ABC):
         self.mj_model = mj_model
         self.model = mjx.put_model(mj_model)
         self.custom_dynamics = custom_dynamics
+
+        # State representation configuration for neural networks
+        self.coordinate_indices = jnp.array(coordinate_indices if coordinate_indices else [])
+        self.angle_indices = jnp.array(angle_indices if angle_indices else [])
 
         # Set actuator limits
         self.u_min = jnp.where(
