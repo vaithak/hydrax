@@ -30,7 +30,7 @@ class DynamicsModel(ABC):
         model: mjx.Model,
         data: mjx.Data,
         state_history: jax.Array | None = None,
-    ) -> mjx.Data:
+    ) -> mjx.Data | tuple[mjx.Data, jax.Array]:
         """Advance the state by one timestep using custom dynamics.
 
         This method should compute the next state given the current state
@@ -45,7 +45,9 @@ class DynamicsModel(ABC):
 
         Returns:
             The next state as an mjx.Data object with updated qpos, qvel,
-            and any other relevant fields.
+            and any other relevant fields. Optionally, can return a tuple
+            of (next_state, updated_history) if the dynamics model maintains
+            internal state history that needs to be propagated.
         """
         pass
 

@@ -119,6 +119,14 @@ class NeuralNetworkDynamics(DynamicsModel):
         self.coordinate_indices = coordinate_indices if coordinate_indices is not None else jnp.array([])
         self.angle_indices = angle_indices if angle_indices is not None else jnp.array([])
 
+        # Validate that indices are within bounds
+        if len(self.angle_indices) > 0:
+            if jnp.any(self.angle_indices < 0) or jnp.any(self.angle_indices >= model.nq):
+                raise ValueError(f"angle_indices must be in range [0, {model.nq})")
+        if len(self.coordinate_indices) > 0:
+            if jnp.any(self.coordinate_indices < 0) or jnp.any(self.coordinate_indices >= model.nq):
+                raise ValueError(f"coordinate_indices must be in range [0, {model.nq})")
+
         # Pre-sort angle indices and convert to Python list for iteration
         # This avoids JAX tracing issues when iterating over angle indices
         if len(self.angle_indices) > 0:
@@ -218,7 +226,7 @@ class NeuralNetworkDynamics(DynamicsModel):
 
         # Subtract first frame's coordinate values from all frames
         reference_qpos = history[0, :self.transformed_qpos_dim]
-        normalized = history.copy()
+        normalized = history  # JAX arrays are immutable, no need to copy
 
         # Use pre-converted Python list to avoid JAX tracing issues
         for idx in self.transformed_coord_indices_list:
@@ -263,7 +271,7 @@ class NeuralNetworkDynamics(DynamicsModel):
             return current_qpos + delta
 
         # Build updated qpos by processing each segment
-        new_qpos = current_qpos.copy()
+        new_qpos = current_qpos  # JAX arrays are immutable, no need to copy
         transformed_idx = 0
         original_idx = 0
 
@@ -297,8 +305,9 @@ class NeuralNetworkDynamics(DynamicsModel):
 
         # Handle remaining positions after last angle
         if original_idx < len(current_qpos):
-            remaining_length = len(current_qpos) - original_idx
-            new_qpos = new_qpos.at[original_idx:].add(delta[transformed_idx:transformed_idx + remaining_length])
+            # Add remaining delta values to remaining qpos values
+            # The number of remaining elements in delta equals the remaining in current_qpos
+            new_qpos = new_qpos.at[original_idx:].add(delta[transformed_idx:])
 
         return new_qpos
 
