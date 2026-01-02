@@ -120,12 +120,11 @@ class NeuralNetworkDynamics(DynamicsModel):
         self.angle_indices = angle_indices if angle_indices is not None else jnp.array([])
 
         # Validate that indices are within bounds
-        if len(self.angle_indices) > 0:
-            if jnp.any(self.angle_indices < 0) or jnp.any(self.angle_indices >= model.nq):
-                raise ValueError(f"angle_indices must be in range [0, {model.nq})")
-        if len(self.coordinate_indices) > 0:
-            if jnp.any(self.coordinate_indices < 0) or jnp.any(self.coordinate_indices >= model.nq):
-                raise ValueError(f"coordinate_indices must be in range [0, {model.nq})")
+        # Note: jnp.any() on empty arrays returns False, so no need for length checks
+        if jnp.any(self.angle_indices < 0) or jnp.any(self.angle_indices >= model.nq):
+            raise ValueError(f"angle_indices must be in range [0, {model.nq})")
+        if jnp.any(self.coordinate_indices < 0) or jnp.any(self.coordinate_indices >= model.nq):
+            raise ValueError(f"coordinate_indices must be in range [0, {model.nq})")
 
         # Pre-sort angle indices and convert to Python list for iteration
         # This avoids JAX tracing issues when iterating over angle indices
@@ -306,7 +305,15 @@ class NeuralNetworkDynamics(DynamicsModel):
         # Handle remaining positions after last angle
         if original_idx < len(current_qpos):
             # Add remaining delta values to remaining qpos values
-            # The number of remaining elements in delta equals the remaining in current_qpos
+            # Validate that dimensions match: each angle adds one extra dimension
+            remaining_original = len(current_qpos) - original_idx
+            remaining_transformed = len(delta) - transformed_idx
+            if remaining_original != remaining_transformed:
+                raise ValueError(
+                    f"Dimension mismatch: {remaining_original} positions remain in qpos "
+                    f"but {remaining_transformed} values remain in delta. This indicates "
+                    f"an internal error in the transformation logic."
+                )
             new_qpos = new_qpos.at[original_idx:].add(delta[transformed_idx:])
 
         return new_qpos
