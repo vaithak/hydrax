@@ -1,6 +1,8 @@
 import time
 from typing import Sequence
 import os
+import csv
+from datetime import datetime
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +35,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     reference: np.ndarray = None,
     reference_fps: float = 30.0,
     record_video: bool = False,
+    log_csv: bool = False,
+    task_name: str = "default",
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -60,6 +64,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         reference: The reference trajectory (qs) to visualize.
         reference_fps: The frame rate of the reference trajectory.
         record_video: Whether to record a video of the simulation.
+        log_csv: Whether to log state-action pairs to CSV for dynamics training.
+        task_name: Name of the task for organizing CSV logs.
     """
     # Report the planning horizon in seconds for debugging
     print(
@@ -133,6 +139,37 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         if not recorder.start():
             record_video = False
         renderer = mujoco.Renderer(mj_model, height=height, width=width)
+
+    # Initialize CSV logging if enabled
+    csv_file = None
+    csv_writer = None
+    if log_csv:
+        # Create data directory structure
+        csv_dir = os.path.join(ROOT, "data_csv", task_name)
+        os.makedirs(csv_dir, exist_ok=True)
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(csv_dir, f"{timestamp}.csv")
+
+        # Open CSV file and create writer
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+
+        # Write header row
+        header = ['timestamp']
+        # Add qpos columns
+        for i in range(mj_model.nq):
+            header.append(f'qpos_{i}')
+        # Add qvel columns
+        for i in range(mj_model.nv):
+            header.append(f'qvel_{i}')
+        # Add ctrl columns
+        for i in range(mj_model.nu):
+            header.append(f'ctrl_{i}')
+
+        csv_writer.writerow(header)
+        print(f"Logging data to: {csv_path}")
 
     # Start the simulation
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
@@ -226,6 +263,14 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             for i in range(sim_steps_per_replan):
                 mj_data.ctrl[:] = np.array(us[i])
 
+                # Log data to CSV before stepping (state-action pair)
+                if log_csv and csv_writer is not None:
+                    row = [mj_data.time]
+                    row.extend(mj_data.qpos.tolist())
+                    row.extend(mj_data.qvel.tolist())
+                    row.extend(mj_data.ctrl.tolist())
+                    csv_writer.writerow(row)
+
                 # Update dynamics state with the state-action pair BEFORE stepping
                 # This maintains consistency with how history is updated during rollouts
                 mjx_data_before = mjx.put_data(mj_model, mj_data)
@@ -256,6 +301,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
     # Preserve the last printout
     print("")
+
+    # Close the CSV file if logging was enabled
+    if log_csv and csv_file is not None:
+        csv_file.close()
+        print("CSV logging completed")
 
     # Close the video recorder if recording was enabled
     if record_video and recorder is not None:

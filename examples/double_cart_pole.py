@@ -32,6 +32,13 @@ parser.add_argument(
     help="Dynamics model to use for rollouts: 'none' (default MJX), 'nn' (neural network GRU)",
 )
 
+# Add CSV logging argument
+parser.add_argument(
+    "--log_csv",
+    action="store_true",
+    help="Log state-action pairs to CSV for dynamics training"
+)
+
 args = parser.parse_args()
 
 # Create the base task without custom dynamics first
@@ -96,4 +103,6 @@ run_interactive(
     fixed_camera_id=0,
     show_traces=True,
     max_traces=1,
+    log_csv=args.log_csv,
+    task_name="double_cart_pole",
 )
