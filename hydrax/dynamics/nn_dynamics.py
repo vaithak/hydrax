@@ -14,6 +14,7 @@ from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from mujoco import mjx
 
@@ -120,7 +121,6 @@ class NeuralNetworkDynamics(DynamicsModel):
         self.angle_indices = angle_indices if angle_indices is not None else jnp.array([])
 
         # Validate that indices are within bounds (use numpy for init-time validation to avoid JIT overhead)
-        import numpy as np
         angle_indices_np = np.asarray(self.angle_indices)
         coord_indices_np = np.asarray(self.coordinate_indices)
         if len(angle_indices_np) > 0 and (np.any(angle_indices_np < 0) or np.any(angle_indices_np >= model.nq)):
@@ -314,9 +314,13 @@ class NeuralNetworkDynamics(DynamicsModel):
             remaining_transformed = len(delta) - transformed_idx
             if remaining_original != remaining_transformed:
                 raise ValueError(
-                    f"Dimension mismatch: {remaining_original} positions remain in qpos "
-                    f"but {remaining_transformed} values remain in delta. This indicates "
-                    f"an internal error in the transformation logic."
+                    f"Dimension mismatch in _update_qpos_from_delta: "
+                    f"{remaining_original} positions remain in qpos but "
+                    f"{remaining_transformed} values remain in delta. "
+                    f"Debug info: qpos_len={len(current_qpos)}, delta_len={len(delta)}, "
+                    f"angle_indices={self.sorted_angle_indices}, "
+                    f"current_pos=(original_idx={original_idx}, transformed_idx={transformed_idx}). "
+                    f"This indicates an internal error in the transformation logic."
                 )
             result = result.at[original_idx:].add(delta[transformed_idx:])
 
