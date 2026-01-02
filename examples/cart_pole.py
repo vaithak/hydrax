@@ -15,7 +15,7 @@ task = CartPole()
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(
-    description="Run an interactive simulation of the cube rotation task."
+    description="Run an interactive simulation of the cart-pole swingup task."
 )
 subparsers = parser.add_subparsers(
     dest="algorithm", help="Sampling algorithm (choose one)"
@@ -23,6 +23,11 @@ subparsers = parser.add_subparsers(
 subparsers.add_parser("ps", help="Predictive Sampling")
 subparsers.add_parser("mppi", help="Model Predictive Path Integral Control")
 subparsers.add_parser("cem", help="Cross-Entropy Method")
+parser.add_argument(
+    "--log_csv",
+    action="store_true",
+    help="Log state-action pairs to CSV for dynamics training"
+)
 args = parser.parse_args()
 
 # Set up the controller
@@ -75,4 +80,6 @@ run_interactive(
     fixed_camera_id=0,
     show_traces=False,
     max_traces=1,
+    log_csv=args.log_csv,
+    task_name="cart_pole",
 )
