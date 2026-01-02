@@ -119,11 +119,13 @@ class NeuralNetworkDynamics(DynamicsModel):
         self.coordinate_indices = coordinate_indices if coordinate_indices is not None else jnp.array([])
         self.angle_indices = angle_indices if angle_indices is not None else jnp.array([])
 
-        # Validate that indices are within bounds
-        # Note: jnp.any() on empty arrays returns False, so no need for length checks
-        if jnp.any(self.angle_indices < 0) or jnp.any(self.angle_indices >= model.nq):
+        # Validate that indices are within bounds (use numpy for init-time validation to avoid JIT overhead)
+        import numpy as np
+        angle_indices_np = np.asarray(self.angle_indices)
+        coord_indices_np = np.asarray(self.coordinate_indices)
+        if len(angle_indices_np) > 0 and (np.any(angle_indices_np < 0) or np.any(angle_indices_np >= model.nq)):
             raise ValueError(f"angle_indices must be in range [0, {model.nq})")
-        if jnp.any(self.coordinate_indices < 0) or jnp.any(self.coordinate_indices >= model.nq):
+        if len(coord_indices_np) > 0 and (np.any(coord_indices_np < 0) or np.any(coord_indices_np >= model.nq)):
             raise ValueError(f"coordinate_indices must be in range [0, {model.nq})")
 
         # Pre-sort angle indices and convert to Python list for iteration
@@ -225,13 +227,14 @@ class NeuralNetworkDynamics(DynamicsModel):
 
         # Subtract first frame's coordinate values from all frames
         reference_qpos = history[0, :self.transformed_qpos_dim]
-        normalized = history  # JAX arrays are immutable, no need to copy
+        # Note: JAX arrays are immutable; each .at operation creates a new array
+        result = history
 
         # Use pre-converted Python list to avoid JAX tracing issues
         for idx in self.transformed_coord_indices_list:
-            normalized = normalized.at[:, idx].add(-reference_qpos[idx])
+            result = result.at[:, idx].add(-reference_qpos[idx])
 
-        return normalized
+        return result
 
     def initialize_state_history(
         self, model: mjx.Model, data: mjx.Data | None = None
@@ -270,7 +273,8 @@ class NeuralNetworkDynamics(DynamicsModel):
             return current_qpos + delta
 
         # Build updated qpos by processing each segment
-        new_qpos = current_qpos  # JAX arrays are immutable, no need to copy
+        # Note: JAX arrays are immutable; each .at operation creates a new array
+        result = current_qpos
         transformed_idx = 0
         original_idx = 0
 
@@ -283,7 +287,7 @@ class NeuralNetworkDynamics(DynamicsModel):
 
             # Update regular positions before this angle
             if segment_length > 0:
-                new_qpos = new_qpos.at[original_idx:angle_idx].add(
+                result = result.at[original_idx:angle_idx].add(
                     delta[transformed_idx - segment_length:transformed_idx]
                 )
 
@@ -297,7 +301,7 @@ class NeuralNetworkDynamics(DynamicsModel):
             new_angle = current_qpos[angle_idx] + angle_delta
             # Normalize to [-pi, pi] range
             new_angle = jnp.arctan2(jnp.sin(new_angle), jnp.cos(new_angle))
-            new_qpos = new_qpos.at[angle_idx].set(new_angle)
+            result = result.at[angle_idx].set(new_angle)
 
             transformed_idx += 2  # Skip the cos/sin pair
             original_idx = angle_idx + 1
@@ -314,9 +318,9 @@ class NeuralNetworkDynamics(DynamicsModel):
                     f"but {remaining_transformed} values remain in delta. This indicates "
                     f"an internal error in the transformation logic."
                 )
-            new_qpos = new_qpos.at[original_idx:].add(delta[transformed_idx:])
+            result = result.at[original_idx:].add(delta[transformed_idx:])
 
-        return new_qpos
+        return result
 
     def transform_state(self, data: mjx.Data) -> jax.Array:
         """Transform state to NN format (angles -> cos/sin).
