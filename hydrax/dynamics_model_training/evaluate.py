@@ -124,8 +124,8 @@ def evaluate_model(
                 state_dim,
             )
 
-            # Predict delta from normalized history
-            predicted_delta, _ = network(normalized_history, initial_gru_state)
+            # Predict delta from normalized history (deterministic=True for evaluation)
+            predicted_delta, _ = network(normalized_history, initial_gru_state, deterministic=True)
 
             # Get non-normalized last state in history (state only, not action)
             last_state = state_history[-1, :state_dim]

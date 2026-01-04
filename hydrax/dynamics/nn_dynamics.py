@@ -49,18 +49,21 @@ class GRUDynamicsNetwork(nnx.Module):
         self.state_dim = state_dim
         self.action_dim = action_dim
 
-        # Create GRU cell and output layer
+        # Create GRU cell and output layers with dropout
         input_dim = state_dim + action_dim
         self.gru_cell = nnx.GRUCell(input_dim, hidden_size, rngs=rngs)
-        self.output_dense = nnx.Linear(hidden_size, state_dim, rngs=rngs)
+        self.output_dense1 = nnx.Linear(hidden_size, hidden_size//2, rngs=rngs)
+        # self.dropout1 = nnx.Dropout(rate=0.1, rngs=rngs)
+        self.output_dense2 = nnx.Linear(hidden_size//2, state_dim, rngs=rngs)
 
-    def __call__(self, state_action_history: jax.Array, gru_state: jax.Array):
+    def __call__(self, state_action_history: jax.Array, gru_state: jax.Array, deterministic: bool = False):
         """Forward pass through the GRU dynamics model.
 
         Args:
             state_action_history: History of (state, action) pairs,
                                  shape (history_length, state_dim + action_dim)
             gru_state: Hidden state of the GRU, shape (hidden_size,)
+            deterministic: If True, disable dropout (for evaluation)
 
         Returns:
             predicted_delta: Predicted change in state (delta_qpos, delta_qvel)
@@ -71,8 +74,11 @@ class GRUDynamicsNetwork(nnx.Module):
         for t in range(state_action_history.shape[0]):
             carry, _ = self.gru_cell(carry, state_action_history[t])
 
-        # Output layer to predict state delta
-        delta = self.output_dense(carry)
+        # Two-layer output with ReLU and dropout
+        x = self.output_dense1(carry)
+        x = nnx.relu(x)
+        # x = self.dropout1(x, deterministic=deterministic)
+        delta = self.output_dense2(x)
 
         return delta, carry
 
@@ -97,6 +103,10 @@ class NeuralNetworkDynamics(DynamicsModel):
         seed: int = 0,
         coordinate_indices: jax.Array | None = None,
         angle_indices: jax.Array | None = None,
+        normalize_velocities: bool = False,
+        qvel_min: jax.Array | None = None,
+        qvel_max: jax.Array | None = None,
+        qvel_range: jax.Array | None = None,
     ):
         """Initialize the neural network dynamics model.
 
@@ -109,6 +119,10 @@ class NeuralNetworkDynamics(DynamicsModel):
             seed: Random seed for initialization
             coordinate_indices: Indices in qpos for Cartesian coordinates (for normalization)
             angle_indices: Indices in qpos for angles (converted to cos/sin)
+            normalize_velocities: If True, velocities are normalized to [-1, 1]
+            qvel_min: Min velocity values for normalization (required if normalize_velocities=True)
+            qvel_max: Max velocity values for normalization (required if normalize_velocities=True)
+            qvel_range: Velocity range for normalization (required if normalize_velocities=True)
         """
         self.model_ref = model
         self.hidden_size = hidden_size
@@ -118,6 +132,12 @@ class NeuralNetworkDynamics(DynamicsModel):
         # Store indices for state transformations
         self.coordinate_indices = coordinate_indices if coordinate_indices is not None else jnp.array([])
         self.angle_indices = angle_indices if angle_indices is not None else jnp.array([])
+
+        # Store velocity normalization parameters
+        self.normalize_velocities = normalize_velocities
+        self.qvel_min = qvel_min
+        self.qvel_max = qvel_max
+        self.qvel_range = qvel_range
 
         # Pre-sort angle indices and convert to Python list for iteration
         # This avoids JAX tracing issues when iterating over angle indices
@@ -302,17 +322,50 @@ class NeuralNetworkDynamics(DynamicsModel):
 
         return new_qpos
 
+    def _normalize_qvel(self, qvel: jax.Array) -> jax.Array:
+        """Normalize velocities to [-1, 1] range.
+
+        Args:
+            qvel: Velocity array
+
+        Returns:
+            Normalized velocity array
+        """
+        if not self.normalize_velocities:
+            return qvel
+
+        # Scale to [-1, 1]: (qvel - min) / (max - min) * 2 - 1
+        normalized = (qvel - self.qvel_min) / self.qvel_range * 2.0 - 1.0
+        return normalized
+
+    def _denormalize_qvel(self, qvel_normalized: jax.Array) -> jax.Array:
+        """Denormalize velocities from [-1, 1] range back to original scale.
+
+        Args:
+            qvel_normalized: Normalized velocity array
+
+        Returns:
+            Denormalized velocity array
+        """
+        if not self.normalize_velocities:
+            return qvel_normalized
+
+        # Inverse scaling: (qvel_norm + 1) / 2 * (max - min) + min
+        denormalized = (qvel_normalized + 1.0) / 2.0 * self.qvel_range + self.qvel_min
+        return denormalized
+
     def transform_state(self, data: mjx.Data) -> jax.Array:
-        """Transform state to NN format (angles -> cos/sin).
+        """Transform state to NN format (angles -> cos/sin, velocities normalized).
 
         Args:
             data: Current state
 
         Returns:
-            Transformed state with angles expanded to (cos, sin) pairs
+            Transformed state with angles expanded to (cos, sin) pairs and normalized velocities
         """
         transformed_qpos = self._transform_qpos_to_nn_format(data.qpos)
-        return jnp.concatenate([transformed_qpos, data.qvel])
+        normalized_qvel = self._normalize_qvel(data.qvel)
+        return jnp.concatenate([transformed_qpos, normalized_qvel])
 
     def step(
         self,
@@ -341,19 +394,25 @@ class NeuralNetworkDynamics(DynamicsModel):
         # Normalize coordinates for network input (only positions, not velocities)
         normalized_history = self._normalize_coordinates(updated_history)
 
-        # Predict state delta using NNX
+        # Predict state delta using NNX (deterministic=True for inference)
         initial_gru_state = jnp.zeros((self.hidden_size,))
-        delta, _ = self.network(normalized_history, initial_gru_state)
+        delta, _ = self.network(normalized_history, initial_gru_state, deterministic=True)
 
         # Split delta into qpos and qvel components
         delta_qpos = delta[:self.transformed_qpos_dim]
-        delta_qvel = delta[self.transformed_qpos_dim:]
+        delta_qvel_normalized = delta[self.transformed_qpos_dim:]
 
         # Update qpos (handling angles with arctan2 and normalization)
         new_qpos = self._update_qpos_from_delta(data.qpos, delta_qpos)
 
-        # Update qvel (simple addition)
-        new_qvel = data.qvel + delta_qvel
+        # Denormalize qvel delta and update qvel
+        # The network predicts delta in normalized space, so we need to:
+        # 1. Get current normalized qvel
+        # 2. Add the predicted delta (in normalized space)
+        # 3. Denormalize back to original space
+        current_qvel_normalized = self._normalize_qvel(data.qvel)
+        new_qvel_normalized = current_qvel_normalized + delta_qvel_normalized
+        new_qvel = self._denormalize_qvel(new_qvel_normalized)
 
         # Create new data object with updated state
         next_data = data.replace(
@@ -374,6 +433,10 @@ class NeuralNetworkDynamics(DynamicsModel):
             "action_dim": self.action_dim,
             "coordinate_indices": self.coordinate_indices,
             "angle_indices": self.angle_indices,
+            "normalize_velocities": self.normalize_velocities,
+            "qvel_min": self.qvel_min,
+            "qvel_max": self.qvel_max,
+            "qvel_range": self.qvel_range,
         }
 
     def save_params(self, path: str):
@@ -427,6 +490,76 @@ class NeuralNetworkDynamics(DynamicsModel):
             network=network,
             coordinate_indices=config.get("coordinate_indices"),
             angle_indices=config.get("angle_indices"),
+        )
+
+        return dynamics
+
+    @classmethod
+    def load_from_checkpoint(cls, model: mjx.Model, checkpoint_dir: str) -> "NeuralNetworkDynamics":
+        """Load model from a training checkpoint directory (Orbax format).
+
+        This method loads checkpoints saved by the training script, which uses
+        Orbax for state serialization and pickle for config.
+
+        Args:
+            model: The MJX model
+            checkpoint_dir: Path to checkpoint directory (e.g., 'checkpoints/double_cart_pole/best_model')
+
+        Returns:
+            Initialized NeuralNetworkDynamics with loaded parameters
+        """
+        import pickle
+        import orbax.checkpoint as ocp
+        from pathlib import Path
+
+        checkpoint_path = Path(checkpoint_dir)
+
+        # Load config
+        with open(checkpoint_path / 'config.pkl', 'rb') as f:
+            config_data = pickle.load(f)
+
+        config = config_data['config']
+
+        # Convert coordinate/angle indices to JAX arrays
+        coordinate_indices = jnp.array(config['coordinate_indices']) if config['coordinate_indices'] is not None else None
+        angle_indices = jnp.array(config['angle_indices']) if config['angle_indices'] is not None else None
+
+        # Load velocity normalization parameters (with backward compatibility)
+        normalize_velocities = config.get('normalize_velocities', False)
+        qvel_min = jnp.array(config['qvel_min']) if config.get('qvel_min') is not None else None
+        qvel_max = jnp.array(config['qvel_max']) if config.get('qvel_max') is not None else None
+        qvel_range = jnp.array(config['qvel_range']) if config.get('qvel_range') is not None else None
+
+        # Initialize network with same architecture
+        network = GRUDynamicsNetwork(
+            hidden_size=config['hidden_size'],
+            state_dim=config['state_dim'],
+            action_dim=config['action_dim'],
+            rngs=nnx.Rngs(0),  # Seed doesn't matter, we'll overwrite params
+        )
+
+        # Load state using Orbax with StandardRestore to handle sharding
+        checkpointer = ocp.StandardCheckpointer()
+
+        # Restore the state
+        state = checkpointer.restore(checkpoint_path / 'state')
+
+        # Merge graph_def and loaded state
+        graph_def, _ = nnx.split(network)
+        network = nnx.merge(graph_def, state)
+
+        # Create the dynamics model with the loaded network
+        dynamics = cls(
+            model=model,
+            hidden_size=config['hidden_size'],
+            history_length=config['history_length'],
+            network=network,
+            coordinate_indices=coordinate_indices,
+            angle_indices=angle_indices,
+            normalize_velocities=normalize_velocities,
+            qvel_min=qvel_min,
+            qvel_max=qvel_max,
+            qvel_range=qvel_range,
         )
 
         return dynamics

@@ -51,9 +51,10 @@ class DynamicsDataset:
 
     The dataset handles:
         - Angle transformation (angle -> cos/sin)
+        - Velocity normalization to [-1, 1] range
         - Creating sliding windows of state-control sequences
 
-    Note: Normalization and delta computation are handled in the training script.
+    Note: Coordinate normalization and delta computation are handled in the training script.
     """
 
     def __init__(
@@ -63,6 +64,7 @@ class DynamicsDataset:
         prediction_horizon: int = 9,
         coordinate_indices: jnp.ndarray | None = None,
         angle_indices: jnp.ndarray | None = None,
+        normalize_velocities: bool = True,
     ):
         """Initialize the dynamics dataset.
 
@@ -72,12 +74,14 @@ class DynamicsDataset:
             prediction_horizon: Number of steps ahead to predict autoregressively
             coordinate_indices: Indices in qpos for Cartesian coordinates (for normalization in training)
             angle_indices: Indices in qpos that are angles (for cos/sin transformation)
+            normalize_velocities: If True, normalize velocities to [-1, 1] range
         """
         self.data_dir = Path(data_dir)
         self.history_length = history_length
         self.prediction_horizon = prediction_horizon
         self.coordinate_indices = coordinate_indices if coordinate_indices is not None else jnp.array([])
         self.angle_indices = angle_indices if angle_indices is not None else jnp.array([])
+        self.normalize_velocities = normalize_velocities
 
         # Pre-sort angle indices for consistent processing
         if len(self.angle_indices) > 0:
@@ -87,6 +91,17 @@ class DynamicsDataset:
 
         # Load all CSV files
         self.trajectories = self._load_all_trajectories()
+
+        # Compute velocity normalization statistics
+        if self.normalize_velocities:
+            self.qvel_min, self.qvel_max = self._compute_velocity_stats()
+            # Add small epsilon to avoid division by zero
+            self.qvel_range = self.qvel_max - self.qvel_min
+            self.qvel_range = jnp.maximum(self.qvel_range, 1e-6)
+        else:
+            self.qvel_min = None
+            self.qvel_max = None
+            self.qvel_range = None
 
         # Compute dimensions after transformation
         if len(self.trajectories) > 0:
@@ -112,6 +127,10 @@ class DynamicsDataset:
         print(f"Original qpos dim: {len(sample_qpos)}, Transformed qpos dim: {self.transformed_qpos_dim}")
         print(f"Transformed state+control dim: {self.transformed_state_control_dim}")
         print(f"Example shape: ({self.history_length + self.prediction_horizon}, {self.transformed_state_control_dim})")
+        if self.normalize_velocities:
+            print(f"Velocity normalization enabled:")
+            print(f"  qvel_min: {self.qvel_min}")
+            print(f"  qvel_max: {self.qvel_max}")
 
     def _load_all_trajectories(self) -> List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
         """Load all CSV files from the data directory."""
@@ -126,6 +145,57 @@ class DynamicsDataset:
             trajectories.append((qpos, qvel, ctrl))
 
         return trajectories
+
+    def _compute_velocity_stats(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Compute min and max velocity values across all trajectories.
+
+        Returns:
+            Tuple of (qvel_min, qvel_max) arrays of shape (nv,)
+        """
+        all_qvel = []
+        for qpos, qvel, ctrl in self.trajectories:
+            all_qvel.append(qvel)
+
+        # Concatenate all velocities
+        all_qvel = jnp.concatenate(all_qvel, axis=0)
+
+        # Compute min and max for each velocity dimension
+        qvel_min = jnp.min(all_qvel, axis=0)
+        qvel_max = jnp.max(all_qvel, axis=0)
+
+        return qvel_min, qvel_max
+
+    def _normalize_qvel(self, qvel: jnp.ndarray) -> jnp.ndarray:
+        """Normalize velocities to [-1, 1] range.
+
+        Args:
+            qvel: Velocity array of shape (..., nv)
+
+        Returns:
+            Normalized velocity array
+        """
+        if not self.normalize_velocities:
+            return qvel
+
+        # Scale to [-1, 1]: (qvel - min) / (max - min) * 2 - 1
+        normalized = (qvel - self.qvel_min) / self.qvel_range * 2.0 - 1.0
+        return normalized
+
+    def denormalize_qvel(self, qvel_normalized: jnp.ndarray) -> jnp.ndarray:
+        """Denormalize velocities from [-1, 1] range back to original scale.
+
+        Args:
+            qvel_normalized: Normalized velocity array of shape (..., nv)
+
+        Returns:
+            Denormalized velocity array
+        """
+        if not self.normalize_velocities:
+            return qvel_normalized
+
+        # Inverse scaling: (qvel_norm + 1) / 2 * (max - min) + min
+        denormalized = (qvel_normalized + 1.0) / 2.0 * self.qvel_range + self.qvel_min
+        return denormalized
 
     def _compute_transformed_coord_indices(self) -> List[int]:
         """Compute coordinate indices after angle expansion.
@@ -208,9 +278,12 @@ class DynamicsDataset:
                 # Transform qpos for all timesteps in window
                 qpos_window_transformed = self._transform_qpos(qpos_window)
 
-                # Combine state and control: [transformed_qpos, qvel, ctrl]
+                # Normalize velocities
+                qvel_window_normalized = self._normalize_qvel(qvel_window)
+
+                # Combine state and control: [transformed_qpos, normalized_qvel, ctrl]
                 state_control_window = jnp.concatenate(
-                    [qpos_window_transformed, qvel_window, ctrl_window],
+                    [qpos_window_transformed, qvel_window_normalized, ctrl_window],
                     axis=-1
                 )
 
@@ -278,6 +351,10 @@ class DynamicsDataset:
         train_dataset.coordinate_indices = self.coordinate_indices
         train_dataset.angle_indices = self.angle_indices
         train_dataset.sorted_angle_indices = self.sorted_angle_indices
+        train_dataset.normalize_velocities = self.normalize_velocities
+        train_dataset.qvel_min = self.qvel_min
+        train_dataset.qvel_max = self.qvel_max
+        train_dataset.qvel_range = self.qvel_range
         train_dataset.transformed_qpos_dim = self.transformed_qpos_dim
         train_dataset.nv = self.nv
         train_dataset.nu = self.nu
@@ -293,6 +370,10 @@ class DynamicsDataset:
         val_dataset.coordinate_indices = self.coordinate_indices
         val_dataset.angle_indices = self.angle_indices
         val_dataset.sorted_angle_indices = self.sorted_angle_indices
+        val_dataset.normalize_velocities = self.normalize_velocities
+        val_dataset.qvel_min = self.qvel_min
+        val_dataset.qvel_max = self.qvel_max
+        val_dataset.qvel_range = self.qvel_range
         val_dataset.transformed_qpos_dim = self.transformed_qpos_dim
         val_dataset.nv = self.nv
         val_dataset.nu = self.nu

@@ -179,8 +179,8 @@ def compute_autoregressive_loss(
             state_dim,
         )
 
-        # Predict delta from normalized history
-        predicted_delta, _ = network(normalized_history, initial_gru_state)
+        # Predict delta from normalized history (deterministic=False for training)
+        predicted_delta, _ = network(normalized_history, initial_gru_state, deterministic=False)
 
         # Get non-normalized last state in history (state only, not action)
         last_state = state_history[-1, :state_dim]
@@ -334,7 +334,7 @@ def train_dynamics_model(
                     state_dim,
                 )
 
-            loss_fn_batch = jax.vmap(loss_fn_single)
+            loss_fn_batch = nnx.vmap(loss_fn_single)
             losses = loss_fn_batch(batch_sequences)
             return jnp.mean(losses)
 
@@ -357,7 +357,7 @@ def train_dynamics_model(
                 state_dim,
             )
 
-        loss_fn_batch = jax.vmap(loss_fn_single)
+        loss_fn_batch = nnx.vmap(loss_fn_single)
         losses = loss_fn_batch(batch_sequences)
         return jnp.mean(losses)
 
@@ -441,6 +441,10 @@ def train_dynamics_model(
                     'coordinate_indices': coordinate_indices.tolist() if coordinate_indices is not None else None,
                     'angle_indices': angle_indices.tolist() if angle_indices is not None else None,
                     'transformed_qpos_dim': transformed_qpos_dim,
+                    'normalize_velocities': dataset.normalize_velocities,
+                    'qvel_min': dataset.qvel_min.tolist() if dataset.qvel_min is not None else None,
+                    'qvel_max': dataset.qvel_max.tolist() if dataset.qvel_max is not None else None,
+                    'qvel_range': dataset.qvel_range.tolist() if dataset.qvel_range is not None else None,
                 },
                 'history': history,
             }
@@ -451,7 +455,7 @@ def train_dynamics_model(
             print(f"  → Saved best model to {checkpoint_path}")
 
         # Save periodic checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 50 == 0:
             checkpoint_path = checkpoint_dir / f'model_epoch_{epoch+1}'
 
             # Save using Orbax
@@ -479,6 +483,10 @@ def train_dynamics_model(
                     'coordinate_indices': coordinate_indices.tolist() if coordinate_indices is not None else None,
                     'angle_indices': angle_indices.tolist() if angle_indices is not None else None,
                     'transformed_qpos_dim': transformed_qpos_dim,
+                    'normalize_velocities': dataset.normalize_velocities,
+                    'qvel_min': dataset.qvel_min.tolist() if dataset.qvel_min is not None else None,
+                    'qvel_max': dataset.qvel_max.tolist() if dataset.qvel_max is not None else None,
+                    'qvel_range': dataset.qvel_range.tolist() if dataset.qvel_range is not None else None,
                 },
                 'history': history,
             }
