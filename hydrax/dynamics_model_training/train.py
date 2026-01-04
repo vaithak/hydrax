@@ -241,8 +241,9 @@ def train_dynamics_model(
 
     # Setup optimizer with weight decay
     optimizer = nnx.Optimizer(
-        network,
-        optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
+        model=network,
+        tx=optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay),
+        wrt=nnx.Param,
     )
 
     # Get sorted angle indices for loss computation

@@ -290,7 +290,7 @@ class SamplingBasedController(ABC):
                 result = self.task.custom_dynamics.step(model, x, history)
                 # Handle different return types from custom dynamics
                 if isinstance(result, tuple):
-                    # Neural network dynamics returns (next_state, updated_history, gru_state)
+                    # Neural network dynamics returns (next_state, updated_history)
                     x_next = result[0]
                     history = result[1] if len(result) > 1 else history
                 else:
