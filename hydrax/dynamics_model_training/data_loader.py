@@ -8,7 +8,6 @@ dynamics models.
 from pathlib import Path
 from typing import List, Tuple
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
@@ -47,14 +46,14 @@ def load_csv_data(csv_path: str) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
 class DynamicsDataset:
     """Dataset for training dynamics models with windowed state-action pairs.
 
-    This dataset creates training examples consisting of:
-        - Input: History of (state, action) pairs over a sliding window (normalized)
-        - Target: Sequence of delta states over prediction horizon
+    This dataset creates training examples consisting of single tensors of size
+    (history_length + prediction_horizon, transformed_state_control_dim).
 
     The dataset handles:
         - Angle transformation (angle -> cos/sin)
-        - Coordinate normalization relative to first point in history
-        - Multi-step autoregressive prediction targets
+        - Creating sliding windows of state-control sequences
+
+    Note: Normalization and delta computation are handled in the training script.
     """
 
     def __init__(
@@ -71,7 +70,7 @@ class DynamicsDataset:
             data_dir: Directory containing CSV files with logged trajectories
             history_length: Number of past timesteps to use as input
             prediction_horizon: Number of steps ahead to predict autoregressively
-            coordinate_indices: Indices in qpos for Cartesian coordinates (for normalization)
+            coordinate_indices: Indices in qpos for Cartesian coordinates (for normalization in training)
             angle_indices: Indices in qpos that are angles (for cos/sin transformation)
         """
         self.data_dir = Path(data_dir)
@@ -95,8 +94,12 @@ class DynamicsDataset:
             transformed_qpos = self._transform_qpos(sample_qpos)
             self.transformed_qpos_dim = len(transformed_qpos)
             self.nv = self.trajectories[0][1].shape[1]  # qvel dimension
+            self.nu = self.trajectories[0][2].shape[1]  # control dimension
 
-            # Compute transformed coordinate indices
+            # Total dimension: transformed_qpos + qvel + ctrl
+            self.transformed_state_control_dim = self.transformed_qpos_dim + self.nv + self.nu
+
+            # Compute transformed coordinate indices (for use in training script)
             self.transformed_coord_indices = self._compute_transformed_coord_indices()
         else:
             raise ValueError("No trajectories found in data directory")
@@ -107,6 +110,8 @@ class DynamicsDataset:
         print(f"Loaded {len(self.trajectories)} trajectories")
         print(f"Created {len(self.examples)} training examples")
         print(f"Original qpos dim: {len(sample_qpos)}, Transformed qpos dim: {self.transformed_qpos_dim}")
+        print(f"Transformed state+control dim: {self.transformed_state_control_dim}")
+        print(f"Example shape: ({self.history_length + self.prediction_horizon}, {self.transformed_state_control_dim})")
 
     def _load_all_trajectories(self) -> List[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
         """Load all CSV files from the data directory."""
@@ -123,7 +128,10 @@ class DynamicsDataset:
         return trajectories
 
     def _compute_transformed_coord_indices(self) -> List[int]:
-        """Compute coordinate indices after angle expansion."""
+        """Compute coordinate indices after angle expansion.
+
+        This is used by the training script for normalization.
+        """
         if len(self.coordinate_indices) == 0:
             return []
 
@@ -168,102 +176,19 @@ class DynamicsDataset:
 
         return jnp.concatenate(parts, axis=-1)
 
-    def _normalize_coordinates(
-        self,
-        transformed_state_action_hist: jnp.ndarray
-    ) -> jnp.ndarray:
-        """Normalize coordinates relative to first timestep in history.
-
-        Args:
-            transformed_state_action_hist: History with transformed qpos,
-                                          shape (history_length, state_dim + action_dim)
-
-        Returns:
-            History with normalized coordinates
-        """
-        if len(self.transformed_coord_indices) == 0:
-            return transformed_state_action_hist
-
-        # Extract first frame's coordinate values as reference
-        reference_qpos = transformed_state_action_hist[0, :self.transformed_qpos_dim]
-        normalized = transformed_state_action_hist.copy()
-
-        # Subtract reference coordinates from all frames
-        for idx in self.transformed_coord_indices:
-            normalized = normalized.at[:, idx].add(-reference_qpos[idx])
-
-        return normalized
-
-    def _compute_delta_qpos(
-        self,
-        current_qpos_transformed: jnp.ndarray,
-        next_qpos_transformed: jnp.ndarray
-    ) -> jnp.ndarray:
-        """Compute delta for qpos in transformed space.
-
-        For angles (represented as cos/sin pairs), the delta is computed as:
-            delta_cos = cos(next - current)
-            delta_sin = sin(next - current)
-
-        Args:
-            current_qpos_transformed: Current qpos in transformed space
-            next_qpos_transformed: Next qpos in transformed space
-
-        Returns:
-            Delta in transformed space
-        """
-        if len(self.sorted_angle_indices) == 0:
-            # No angles, simple subtraction
-            return next_qpos_transformed - current_qpos_transformed
-
-        # Build delta by processing each segment
-        delta_parts = []
-        transformed_idx = 0
-        original_idx = 0
-
-        for angle_idx in self.sorted_angle_indices:
-            # Delta for regular positions before this angle
-            segment_length = angle_idx - original_idx
-            if segment_length > 0:
-                delta_parts.append(
-                    next_qpos_transformed[transformed_idx:transformed_idx + segment_length] -
-                    current_qpos_transformed[transformed_idx:transformed_idx + segment_length]
-                )
-                transformed_idx += segment_length
-
-            # Delta for angle (compute cos(delta), sin(delta))
-            # We have cos(current), sin(current) and cos(next), sin(next)
-            cos_current = current_qpos_transformed[transformed_idx]
-            sin_current = current_qpos_transformed[transformed_idx + 1]
-            cos_next = next_qpos_transformed[transformed_idx]
-            sin_next = next_qpos_transformed[transformed_idx + 1]
-
-            # Using angle difference formula:
-            # cos(next - current) = cos(next)*cos(current) + sin(next)*sin(current)
-            # sin(next - current) = sin(next)*cos(current) - cos(next)*sin(current)
-            cos_delta = cos_next * cos_current + sin_next * sin_current
-            sin_delta = sin_next * cos_current - cos_next * sin_current
-
-            delta_parts.append(jnp.array([cos_delta, sin_delta]))
-
-            transformed_idx += 2
-            original_idx = angle_idx + 1
-
-        # Delta for remaining positions after last angle
-        if transformed_idx < len(current_qpos_transformed):
-            delta_parts.append(
-                next_qpos_transformed[transformed_idx:] -
-                current_qpos_transformed[transformed_idx:]
-            )
-
-        return jnp.concatenate(delta_parts)
-
-    def _create_examples(self) -> List[Tuple[jnp.ndarray, jnp.ndarray]]:
+    def _create_examples(self) -> List[jnp.ndarray]:
         """Create windowed training examples from trajectories.
 
-        Each example consists of:
-            - state_action_history: (history_length, state_dim + action_dim) - normalized
-            - targets: (prediction_horizon, state_dim) - deltas in transformed space
+        Each example is a single tensor of shape:
+            (history_length + prediction_horizon, transformed_state_control_dim)
+
+        The tensor contains:
+            - First history_length timesteps: state + control at [t-history_length:t]
+            - Next prediction_horizon timesteps: state + control at [t:t+prediction_horizon]
+
+        Note: The last control input in each example won't be used in training,
+        but is included for simplicity. The training script will handle extracting
+        the relevant slices for history and prediction.
         """
         examples = []
 
@@ -271,56 +196,25 @@ class DynamicsDataset:
             T = len(qpos_traj)
 
             # Create overlapping windows
-            for t in range(self.history_length, T - self.prediction_horizon + 1):
-                # Get history window [t-history_length : t]
-                qpos_hist = qpos_traj[t - self.history_length:t]
-                qvel_hist = qvel_traj[t - self.history_length:t]
-                ctrl_hist = ctrl_traj[t - self.history_length:t]
+            # We need history_length + prediction_horizon timesteps total
+            window_size = self.history_length + self.prediction_horizon
 
-                # Transform qpos in history
-                qpos_hist_transformed = self._transform_qpos(qpos_hist)
+            for t in range(T - window_size + 1):
+                # Get window [t : t + window_size]
+                qpos_window = qpos_traj[t:t + window_size]
+                qvel_window = qvel_traj[t:t + window_size]
+                ctrl_window = ctrl_traj[t:t + window_size]
 
-                # Combine state and action for history
-                state_hist = jnp.concatenate([qpos_hist_transformed, qvel_hist], axis=-1)
-                state_action_hist = jnp.concatenate([state_hist, ctrl_hist], axis=-1)
+                # Transform qpos for all timesteps in window
+                qpos_window_transformed = self._transform_qpos(qpos_window)
 
-                # Normalize coordinates relative to first point in history
-                state_action_hist_normalized = self._normalize_coordinates(state_action_hist)
+                # Combine state and control: [transformed_qpos, qvel, ctrl]
+                state_control_window = jnp.concatenate(
+                    [qpos_window_transformed, qvel_window, ctrl_window],
+                    axis=-1
+                )
 
-                # Get targets: deltas for prediction_horizon steps
-                target_deltas = []
-
-                for h in range(self.prediction_horizon):
-                    # Current state at t + h - 1 (or t-1 for h=0)
-                    current_idx = t + h - 1
-                    next_idx = t + h
-
-                    current_qpos = qpos_traj[current_idx]
-                    next_qpos = qpos_traj[next_idx]
-                    current_qvel = qvel_traj[current_idx]
-                    next_qvel = qvel_traj[next_idx]
-
-                    # Transform positions
-                    current_qpos_transformed = self._transform_qpos(current_qpos)
-                    next_qpos_transformed = self._transform_qpos(next_qpos)
-
-                    # Compute delta qpos (handling angles properly)
-                    delta_qpos = self._compute_delta_qpos(
-                        current_qpos_transformed,
-                        next_qpos_transformed
-                    )
-
-                    # Delta qvel is simple subtraction
-                    delta_qvel = next_qvel - current_qvel
-
-                    # Combine into full state delta
-                    delta_state = jnp.concatenate([delta_qpos, delta_qvel])
-                    target_deltas.append(delta_state)
-
-                # Stack targets
-                targets = jnp.stack(target_deltas)  # (prediction_horizon, state_dim)
-
-                examples.append((state_action_hist_normalized, targets))
+                examples.append(state_control_window)
 
         return examples
 
@@ -328,39 +222,31 @@ class DynamicsDataset:
         """Return the number of training examples."""
         return len(self.examples)
 
-    def __getitem__(self, idx: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def __getitem__(self, idx: int) -> jnp.ndarray:
         """Get a training example by index.
 
         Returns:
-            Tuple of (state_action_history, targets)
-                - state_action_history: (history_length, state_dim + action_dim)
-                - targets: (prediction_horizon, state_dim)
+            Single tensor of shape (history_length + prediction_horizon, transformed_state_control_dim)
+            containing the complete sequence (history + future states)
         """
         return self.examples[idx]
 
-    def get_batch(self, indices: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def get_batch(self, indices: jnp.ndarray) -> jnp.ndarray:
         """Get a batch of training examples.
 
         Args:
             indices: Array of indices to retrieve
 
         Returns:
-            Tuple of batched (state_action_history, targets)
-                - state_action_history: (batch_size, history_length, state_dim + action_dim)
-                - targets: (batch_size, prediction_horizon, state_dim)
+            Batched examples of shape (batch_size, history_length + prediction_horizon, transformed_state_control_dim)
+            containing complete sequences (history + future states)
         """
-        batch_state_action = []
-        batch_targets = []
+        batch_examples = []
 
         for idx in indices:
-            state_action, targets = self.examples[int(idx)]
-            batch_state_action.append(state_action)
-            batch_targets.append(targets)
+            batch_examples.append(self.examples[int(idx)])
 
-        return (
-            jnp.stack(batch_state_action),
-            jnp.stack(batch_targets),
-        )
+        return jnp.stack(batch_examples)
 
     def split(
         self,
@@ -394,6 +280,8 @@ class DynamicsDataset:
         train_dataset.sorted_angle_indices = self.sorted_angle_indices
         train_dataset.transformed_qpos_dim = self.transformed_qpos_dim
         train_dataset.nv = self.nv
+        train_dataset.nu = self.nu
+        train_dataset.transformed_state_control_dim = self.transformed_state_control_dim
         train_dataset.transformed_coord_indices = self.transformed_coord_indices
         train_dataset.trajectories = self.trajectories
         train_dataset.examples = [self.examples[i] for i in train_indices]
@@ -407,6 +295,8 @@ class DynamicsDataset:
         val_dataset.sorted_angle_indices = self.sorted_angle_indices
         val_dataset.transformed_qpos_dim = self.transformed_qpos_dim
         val_dataset.nv = self.nv
+        val_dataset.nu = self.nu
+        val_dataset.transformed_state_control_dim = self.transformed_state_control_dim
         val_dataset.transformed_coord_indices = self.transformed_coord_indices
         val_dataset.trajectories = self.trajectories
         val_dataset.examples = [self.examples[i] for i in val_indices]

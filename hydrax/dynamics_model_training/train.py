@@ -93,79 +93,132 @@ def apply_delta_to_state(
     return jnp.concatenate([next_qpos, next_qvel])
 
 
+def normalize_history(
+    history: jnp.ndarray,
+    coordinate_indices: jnp.ndarray,
+    state_dim: int,
+) -> jnp.ndarray:
+    """Normalize coordinate indices in history using first timestep as origin.
+
+    Args:
+        history: History of shape (history_length, state_dim + action_dim)
+        coordinate_indices: Indices in the state to normalize (transformed coordinates)
+        state_dim: Dimension of the state
+
+    Returns:
+        Normalized history with coordinates relative to first timestep
+    """
+    if len(coordinate_indices) == 0:
+        return history
+
+    # Extract first state's coordinates as origin
+    origin = history[0, coordinate_indices]
+
+    # Normalize all timesteps
+    normalized_history = history.copy()
+    for coord_idx in coordinate_indices:
+        normalized_history = normalized_history.at[:, coord_idx].set(
+            history[:, coord_idx] - origin
+        )
+
+    return normalized_history
+
+
 def compute_autoregressive_loss(
     network: GRUDynamicsNetwork,
-    state_action_history: jnp.ndarray,
-    targets: jnp.ndarray,
-    controls: jnp.ndarray,
+    sequence: jnp.ndarray,
+    history_length: int,
+    prediction_horizon: int,
     transformed_qpos_dim: int,
     sorted_angle_indices: list,
+    transformed_coord_indices: list,
     hidden_size: int,
+    state_dim: int,
 ) -> jnp.ndarray:
     """Compute autoregressive multi-step prediction loss.
 
     The model predicts delta states autoregressively:
-        - Predict delta_1 from history
-        - Apply delta_1 to get next state, update history
-        - Predict delta_2 from updated history
-        - Continue for prediction_horizon steps
+        1. Initialize state_history with first history_length timesteps
+        2. For each prediction step (0 to prediction_horizon-1):
+           - Normalize current history's coordinate indices using first step as origin
+           - Predict delta from normalized history
+           - Add delta to non-normalized last state (using trig formulas for angles)
+           - Construct new history by appending new state and removing oldest
+        3. Compute loss as MSE between all predicted states and ground truth
 
     Args:
         network: The GRU dynamics network
-        state_action_history: Initial history, shape (history_length, state_dim + action_dim)
-        targets: Target deltas, shape (prediction_horizon, state_dim)
-        controls: Control inputs for prediction horizon, shape (prediction_horizon, action_dim)
+        sequence: Complete sequence, shape (history_length + prediction_horizon, state_dim + action_dim)
+        history_length: Number of timesteps in history
+        prediction_horizon: Number of steps to predict
         transformed_qpos_dim: Dimension of transformed qpos
         sorted_angle_indices: Original indices of angles in qpos (sorted)
+        transformed_coord_indices: Indices of coordinates in transformed state (for normalization)
         hidden_size: Size of GRU hidden state
+        state_dim: Dimension of the state (transformed_qpos_dim + nv)
 
     Returns:
         Mean squared error loss over all prediction steps
     """
-    prediction_horizon = targets.shape[0]
-    history_length = state_action_history.shape[0]
-    state_dim = targets.shape[1]
+    action_dim = sequence.shape[1] - state_dim
 
-    # Initialize history and GRU state
-    current_history = state_action_history
+    # Initialize state_history with first history_length timesteps
+    state_history = sequence[:history_length]
+
+    # Initialize GRU state
     initial_gru_state = jnp.zeros((hidden_size,))
 
-    total_loss = 0.0
+    # Store predicted states for loss computation
+    predicted_states = []
 
     for h in range(prediction_horizon):
-        # Predict delta from current history
-        predicted_delta, _ = network(current_history, initial_gru_state)
+        # Normalize current history's coordinate indices using first step as origin
+        normalized_history = normalize_history(
+            state_history,
+            jnp.array(transformed_coord_indices),
+            state_dim,
+        )
 
-        # Compute loss for this step
-        target_delta = targets[h]
-        step_loss = jnp.mean(jnp.square(predicted_delta - target_delta))
-        total_loss += step_loss
+        # Predict delta from normalized history
+        predicted_delta, _ = network(normalized_history, initial_gru_state)
 
-        # Update history for next prediction (if not last step)
+        # Get non-normalized last state in history (state only, not action)
+        last_state = state_history[-1, :state_dim]
+
+        # Add delta to non-normalized last state (using trig formulas for angles)
+        next_state = apply_delta_to_state(
+            last_state,
+            predicted_delta,
+            transformed_qpos_dim,
+            sorted_angle_indices,
+        )
+
+        predicted_states.append(next_state)
+
+        # Update history for next iteration (if not last step)
         if h < prediction_horizon - 1:
-            # Get current state from last entry in history
-            current_state = current_history[-1, :state_dim]
+            # Get next control from the sequence
+            next_control = sequence[history_length + h, state_dim:]
 
-            # Apply predicted delta to get next state
-            next_state = apply_delta_to_state(
-                current_state,
-                predicted_delta,
-                transformed_qpos_dim,
-                sorted_angle_indices,
-            )
-
-            # Get next control
-            next_control = controls[h]
-
-            # Create next state-action pair
+            # Construct new state-action pair
             next_state_action = jnp.concatenate([next_state, next_control])
 
-            # Update history (shift and append)
-            current_history = jnp.roll(current_history, shift=-1, axis=0)
-            current_history = current_history.at[-1].set(next_state_action)
+            # Update history: remove oldest, append new
+            state_history = jnp.concatenate([
+                state_history[1:],
+                jnp.expand_dims(next_state_action, 0)
+            ], axis=0)
 
-    # Average loss over prediction horizon
-    return total_loss / prediction_horizon
+    # Stack predicted states
+    predicted_states = jnp.stack(predicted_states, axis=0)  # (prediction_horizon, state_dim)
+
+    # Get ground truth states from sequence
+    ground_truth_states = sequence[history_length:history_length + prediction_horizon, :state_dim]
+
+    # Compute loss as MSE between predicted and ground truth
+    loss = jnp.mean(jnp.square(predicted_states - ground_truth_states))
+
+    return loss
 
 
 def train_dynamics_model(
@@ -223,10 +276,11 @@ def train_dynamics_model(
     print(f"Train examples: {len(train_dataset)}, Val examples: {len(val_dataset)}")
 
     # Get dimensions
-    state_action_hist_sample, targets_sample = train_dataset[0]
-    state_dim = targets_sample.shape[1]
-    action_dim = state_action_hist_sample.shape[1] - state_dim
+    sequence_sample = train_dataset[0]
+    state_action_dim = sequence_sample.shape[1]
     transformed_qpos_dim = dataset.transformed_qpos_dim
+    state_dim = transformed_qpos_dim + dataset.nv
+    action_dim = state_action_dim - state_dim
 
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
     print(f"Transformed qpos dim: {transformed_qpos_dim}, qvel dim: {dataset.nv}")
@@ -246,8 +300,9 @@ def train_dynamics_model(
         wrt=nnx.Param,
     )
 
-    # Get sorted angle indices for loss computation
+    # Get sorted angle indices and transformed coordinate indices for loss computation
     sorted_angle_indices = dataset.sorted_angle_indices
+    transformed_coord_indices = dataset.transformed_coord_indices
 
     # Training history
     history = {
@@ -278,49 +333,34 @@ def train_dynamics_model(
         with tqdm(total=num_batches, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
             for i in range(num_batches):
                 batch_idx = train_indices[i * batch_size:(i + 1) * batch_size]
-                batch_state_action, batch_targets = train_dataset.get_batch(batch_idx)
+                batch_sequences = train_dataset.get_batch(batch_idx)
 
-                # Extract controls from history for autoregressive rollout
-                # Controls needed: from the last history entry onwards
-                batch_controls = batch_state_action[:, -1:, -action_dim:]  # Last control in history
+                # Define loss function for batch
+                def loss_fn(model):
+                    # Define loss function for a single sequence
+                    def loss_fn_single(sequence):
+                        return compute_autoregressive_loss(
+                            model,
+                            sequence,
+                            history_length,
+                            prediction_horizon,
+                            transformed_qpos_dim,
+                            sorted_angle_indices,
+                            transformed_coord_indices,
+                            hidden_size,
+                            state_dim,
+                        )
 
-                # For autoregressive prediction, we need controls for each step
-                # We'll use a placeholder here - in practice, these should come from the data
-                # For now, we'll repeat the last control (this should be fixed in real usage)
-                batch_controls_horizon = jnp.tile(
-                    batch_controls,
-                    (1, prediction_horizon, 1)
-                )  # (batch_size, prediction_horizon, action_dim)
-
-                # Define loss function for a single example
-                def loss_fn_single(state_action_hist, targets, controls):
-                    return compute_autoregressive_loss(
-                        network,
-                        state_action_hist,
-                        targets,
-                        controls,
-                        transformed_qpos_dim,
-                        sorted_angle_indices,
-                        hidden_size,
-                    )
-
-                # Vectorize over batch
-                loss_fn_batch = jax.vmap(loss_fn_single)
-
-                # Define loss and grad function
-                def loss_fn():
-                    losses = loss_fn_batch(
-                        batch_state_action,
-                        batch_targets,
-                        batch_controls_horizon,
-                    )
+                    # Vectorize over batch
+                    loss_fn_batch = jax.vmap(loss_fn_single)
+                    losses = loss_fn_batch(batch_sequences)
                     return jnp.mean(losses)
 
                 # Compute loss and gradients
-                loss, grads = nnx.value_and_grad(loss_fn)()
+                loss, grads = nnx.value_and_grad(loss_fn)(network)
 
                 # Update parameters
-                optimizer.update(grads)
+                optimizer.update(network, grads)
 
                 train_losses.append(float(loss))
                 pbar.set_postfix({'train_loss': f'{loss:.6f}'})
@@ -335,33 +375,24 @@ def train_dynamics_model(
 
         for i in range(num_val_batches):
             batch_idx = jnp.arange(i * batch_size, (i + 1) * batch_size)
-            batch_state_action, batch_targets = val_dataset.get_batch(batch_idx)
-
-            # Extract controls (same as training)
-            batch_controls = batch_state_action[:, -1:, -action_dim:]
-            batch_controls_horizon = jnp.tile(
-                batch_controls,
-                (1, prediction_horizon, 1)
-            )
+            batch_sequences = val_dataset.get_batch(batch_idx)
 
             # Compute loss
-            def loss_fn_single(state_action_hist, targets, controls):
+            def loss_fn_single(sequence):
                 return compute_autoregressive_loss(
                     network,
-                    state_action_hist,
-                    targets,
-                    controls,
+                    sequence,
+                    history_length,
+                    prediction_horizon,
                     transformed_qpos_dim,
                     sorted_angle_indices,
+                    transformed_coord_indices,
                     hidden_size,
+                    state_dim,
                 )
 
             loss_fn_batch = jax.vmap(loss_fn_single)
-            losses = loss_fn_batch(
-                batch_state_action,
-                batch_targets,
-                batch_controls_horizon,
-            )
+            losses = loss_fn_batch(batch_sequences)
             val_losses.append(float(jnp.mean(losses)))
 
         avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float('inf')
@@ -373,57 +404,79 @@ def train_dynamics_model(
         # Save checkpoint if best validation loss
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            checkpoint_path = checkpoint_dir / 'best_model.pkl'
+            checkpoint_path = checkpoint_dir / 'best_model'
 
-            # Save using NNX serialization
+            # Save using Orbax
+            from flax.training import orbax_utils
+            import orbax.checkpoint as ocp
             import pickle
+
+            # Split network into graph_def and state
             graph_def, state = nnx.split(network)
-            save_data = {
-                'graph_def': graph_def,
-                'state': state,
+
+            # Create checkpointer
+            checkpointer = ocp.PyTreeCheckpointer()
+
+            # Save state using Orbax (force=True to allow overwriting)
+            checkpointer.save(checkpoint_path / 'state', state, force=True)
+
+            # Save config and history separately with pickle
+            config_data = {
                 'config': {
                     'hidden_size': hidden_size,
                     'state_dim': state_dim,
                     'action_dim': action_dim,
                     'history_length': history_length,
                     'prediction_horizon': prediction_horizon,
-                    'coordinate_indices': coordinate_indices,
-                    'angle_indices': angle_indices,
+                    'coordinate_indices': coordinate_indices.tolist() if coordinate_indices is not None else None,
+                    'angle_indices': angle_indices.tolist() if angle_indices is not None else None,
                     'transformed_qpos_dim': transformed_qpos_dim,
                 },
                 'history': history,
             }
 
-            with open(checkpoint_path, 'wb') as f:
-                pickle.dump(save_data, f)
+            with open(checkpoint_path / 'config.pkl', 'wb') as f:
+                pickle.dump(config_data, f)
 
             print(f"  → Saved best model to {checkpoint_path}")
 
         # Save periodic checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
-            checkpoint_path = checkpoint_dir / f'model_epoch_{epoch+1}.pkl'
+            checkpoint_path = checkpoint_dir / f'model_epoch_{epoch+1}'
 
+            # Save using Orbax
+            from flax.training import orbax_utils
+            import orbax.checkpoint as ocp
+            import pickle
+
+            # Split network into graph_def and state
             graph_def, state = nnx.split(network)
-            save_data = {
-                'graph_def': graph_def,
-                'state': state,
+
+            # Create checkpointer
+            checkpointer = ocp.PyTreeCheckpointer()
+
+            # Save state using Orbax (force=True to allow overwriting)
+            checkpointer.save(checkpoint_path / 'state', state, force=True)
+
+            # Save config and history separately with pickle
+            config_data = {
                 'config': {
                     'hidden_size': hidden_size,
                     'state_dim': state_dim,
                     'action_dim': action_dim,
                     'history_length': history_length,
                     'prediction_horizon': prediction_horizon,
-                    'coordinate_indices': coordinate_indices,
-                    'angle_indices': angle_indices,
+                    'coordinate_indices': coordinate_indices.tolist() if coordinate_indices is not None else None,
+                    'angle_indices': angle_indices.tolist() if angle_indices is not None else None,
                     'transformed_qpos_dim': transformed_qpos_dim,
                 },
                 'history': history,
             }
 
-            with open(checkpoint_path, 'wb') as f:
-                pickle.dump(save_data, f)
+            with open(checkpoint_path / 'config.pkl', 'wb') as f:
+                pickle.dump(config_data, f)
 
     print(f"\nTraining complete! Best validation loss: {best_val_loss:.6f}")
-    print(f"Best model saved to: {checkpoint_dir / 'best_model.pkl'}")
+    print(f"Best model saved to: {checkpoint_dir / 'best_model'}")
 
     return network, history

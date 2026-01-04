@@ -22,23 +22,46 @@ def load_trained_model(checkpoint_path: str) -> Tuple[GRUDynamicsNetwork, Dict[s
     """Load a trained dynamics model from checkpoint.
 
     Args:
-        checkpoint_path: Path to the checkpoint file
+        checkpoint_path: Path to the checkpoint directory
 
     Returns:
         Tuple of (network, config)
     """
-    with open(checkpoint_path, 'rb') as f:
-        save_data = pickle.load(f)
-
-    # Reconstruct network
-    network = jax.tree_util.tree_map(lambda x: x, save_data['graph_def'])
-    network = jax.tree_util.tree_map(lambda x: x, save_data['state'])
-
-    # Use nnx.merge to reconstruct the module
+    from pathlib import Path
+    import orbax.checkpoint as ocp
     from flax import nnx
-    network = nnx.merge(save_data['graph_def'], save_data['state'])
 
-    config = save_data['config']
+    checkpoint_path = Path(checkpoint_path)
+
+    # Load config
+    with open(checkpoint_path / 'config.pkl', 'rb') as f:
+        config_data = pickle.load(f)
+
+    config = config_data['config']
+
+    # Convert lists back to arrays
+    if config['coordinate_indices'] is not None:
+        import jax.numpy as jnp
+        config['coordinate_indices'] = jnp.array(config['coordinate_indices'])
+    if config['angle_indices'] is not None:
+        import jax.numpy as jnp
+        config['angle_indices'] = jnp.array(config['angle_indices'])
+
+    # Recreate network with same architecture
+    network = GRUDynamicsNetwork(
+        hidden_size=config['hidden_size'],
+        state_dim=config['state_dim'],
+        action_dim=config['action_dim'],
+        rngs=nnx.Rngs(0),
+    )
+
+    # Load state using Orbax
+    checkpointer = ocp.PyTreeCheckpointer()
+    graph_def, state = nnx.split(network)
+    restored_state = checkpointer.restore(checkpoint_path / 'state', item=state)
+
+    # Merge back
+    network = nnx.merge(graph_def, restored_state)
 
     return network, config
 
@@ -60,11 +83,14 @@ def evaluate_model(
     Returns:
         Dictionary containing evaluation metrics
     """
-    from hydrax.dynamics_model_training.train import apply_delta_to_state
+    from hydrax.dynamics_model_training.train import apply_delta_to_state, normalize_history
 
     hidden_size = config['hidden_size']
     transformed_qpos_dim = config['transformed_qpos_dim']
+    history_length = config['history_length']
+    prediction_horizon = config['prediction_horizon']
     sorted_angle_indices = dataset.sorted_angle_indices
+    transformed_coord_indices = dataset.transformed_coord_indices
 
     # Metrics to track
     metrics = {
@@ -74,47 +100,69 @@ def evaluate_model(
 
     num_examples = min(num_examples, len(dataset))
 
-    for i in range(num_examples):
-        state_action_history, targets = dataset[i]
-        prediction_horizon = targets.shape[0]
-        state_dim = targets.shape[1]
+    # Compute state dimension
+    state_dim = transformed_qpos_dim + dataset.nv
 
-        # Initialize
-        current_history = state_action_history
+    for i in range(num_examples):
+        sequence = dataset[i]
+
+        # Initialize state_history with first history_length timesteps
+        state_history = sequence[:history_length]
+
+        # Initialize GRU state
         initial_gru_state = jnp.zeros((hidden_size,))
 
         step_mse = []
         step_mae = []
+        predicted_states = []
 
         for h in range(prediction_horizon):
-            # Predict delta
-            predicted_delta, _ = network(current_history, initial_gru_state)
+            # Normalize current history's coordinate indices using first step as origin
+            normalized_history = normalize_history(
+                state_history,
+                jnp.array(transformed_coord_indices),
+                state_dim,
+            )
 
-            # Compare with target
-            target_delta = targets[h]
-            mse = jnp.mean(jnp.square(predicted_delta - target_delta))
-            mae = jnp.mean(jnp.abs(predicted_delta - target_delta))
+            # Predict delta from normalized history
+            predicted_delta, _ = network(normalized_history, initial_gru_state)
+
+            # Get non-normalized last state in history (state only, not action)
+            last_state = state_history[-1, :state_dim]
+
+            # Add delta to non-normalized last state (using trig formulas for angles)
+            next_state = apply_delta_to_state(
+                last_state,
+                predicted_delta,
+                transformed_qpos_dim,
+                sorted_angle_indices,
+            )
+
+            predicted_states.append(next_state)
+
+            # Get ground truth state for this step
+            ground_truth_state = sequence[history_length + h, :state_dim]
+
+            # Compute metrics
+            mse = jnp.mean(jnp.square(next_state - ground_truth_state))
+            mae = jnp.mean(jnp.abs(next_state - ground_truth_state))
 
             step_mse.append(float(mse))
             step_mae.append(float(mae))
 
             # Update history for next step
             if h < prediction_horizon - 1:
-                current_state = current_history[-1, :state_dim]
-                next_state = apply_delta_to_state(
-                    current_state,
-                    predicted_delta,
-                    transformed_qpos_dim,
-                    sorted_angle_indices,
-                )
+                # Get next control from the sequence
+                next_control = sequence[history_length + h, state_dim:]
 
-                # Use zero control as placeholder (ideally should come from data)
-                action_dim = current_history.shape[1] - state_dim
-                next_control = current_history[-1, state_dim:]
-
+                # Construct new state-action pair
                 next_state_action = jnp.concatenate([next_state, next_control])
-                current_history = jnp.roll(current_history, shift=-1, axis=0)
-                current_history = current_history.at[-1].set(next_state_action)
+
+                # Update history: remove oldest, append new
+                state_history = jnp.concatenate([
+                    state_history[1:],
+                    jnp.expand_dims(next_state_action, 0)
+                ], axis=0)
 
         metrics['mse_per_step'].append(step_mse)
         metrics['mae_per_step'].append(step_mae)
