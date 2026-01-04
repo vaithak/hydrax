@@ -316,6 +316,51 @@ def train_dynamics_model(
     checkpoint_dir = Path(checkpoint_dir) / task_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Define training and validation step functions outside the loop
+    @nnx.jit
+    def train_step(model, batch_sequences):
+        """JIT-compiled training step."""
+        def loss_fn(model):
+            def loss_fn_single(sequence):
+                return compute_autoregressive_loss(
+                    model,
+                    sequence,
+                    history_length,
+                    prediction_horizon,
+                    transformed_qpos_dim,
+                    sorted_angle_indices,
+                    transformed_coord_indices,
+                    hidden_size,
+                    state_dim,
+                )
+
+            loss_fn_batch = jax.vmap(loss_fn_single)
+            losses = loss_fn_batch(batch_sequences)
+            return jnp.mean(losses)
+
+        loss, grads = nnx.value_and_grad(loss_fn)(model)
+        return loss, grads
+
+    @nnx.jit
+    def val_step(model, batch_sequences):
+        """JIT-compiled validation step."""
+        def loss_fn_single(sequence):
+            return compute_autoregressive_loss(
+                model,
+                sequence,
+                history_length,
+                prediction_horizon,
+                transformed_qpos_dim,
+                sorted_angle_indices,
+                transformed_coord_indices,
+                hidden_size,
+                state_dim,
+            )
+
+        loss_fn_batch = jax.vmap(loss_fn_single)
+        losses = loss_fn_batch(batch_sequences)
+        return jnp.mean(losses)
+
     print(f"\nStarting training for {num_epochs} epochs...")
     print(f"Checkpoints will be saved to: {checkpoint_dir}")
 
@@ -335,29 +380,8 @@ def train_dynamics_model(
                 batch_idx = train_indices[i * batch_size:(i + 1) * batch_size]
                 batch_sequences = train_dataset.get_batch(batch_idx)
 
-                # Define loss function for batch
-                def loss_fn(model):
-                    # Define loss function for a single sequence
-                    def loss_fn_single(sequence):
-                        return compute_autoregressive_loss(
-                            model,
-                            sequence,
-                            history_length,
-                            prediction_horizon,
-                            transformed_qpos_dim,
-                            sorted_angle_indices,
-                            transformed_coord_indices,
-                            hidden_size,
-                            state_dim,
-                        )
-
-                    # Vectorize over batch
-                    loss_fn_batch = jax.vmap(loss_fn_single)
-                    losses = loss_fn_batch(batch_sequences)
-                    return jnp.mean(losses)
-
-                # Compute loss and gradients
-                loss, grads = nnx.value_and_grad(loss_fn)(network)
+                # Compute loss and gradients using JIT-compiled function
+                loss, grads = train_step(network, batch_sequences)
 
                 # Update parameters
                 optimizer.update(network, grads)
@@ -377,23 +401,9 @@ def train_dynamics_model(
             batch_idx = jnp.arange(i * batch_size, (i + 1) * batch_size)
             batch_sequences = val_dataset.get_batch(batch_idx)
 
-            # Compute loss
-            def loss_fn_single(sequence):
-                return compute_autoregressive_loss(
-                    network,
-                    sequence,
-                    history_length,
-                    prediction_horizon,
-                    transformed_qpos_dim,
-                    sorted_angle_indices,
-                    transformed_coord_indices,
-                    hidden_size,
-                    state_dim,
-                )
-
-            loss_fn_batch = jax.vmap(loss_fn_single)
-            losses = loss_fn_batch(batch_sequences)
-            val_losses.append(float(jnp.mean(losses)))
+            # Compute loss using JIT-compiled function
+            loss = val_step(network, batch_sequences)
+            val_losses.append(float(loss))
 
         avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float('inf')
         history['val_loss'].append(avg_val_loss)

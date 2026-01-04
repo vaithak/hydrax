@@ -57,7 +57,8 @@ def main():
     network, history = train_dynamics_model(**config)
 
     # Plot training history
-    checkpoint_dir = Path(__file__).parent / 'checkpoints' / config['task_name']
+    # Use the same checkpoint directory path that train_dynamics_model uses
+    checkpoint_dir = Path(config['data_dir']).parent / 'dynamics_model_training' / 'checkpoints' / config['task_name']
     plot_training_history(
         history,
         save_path=str(checkpoint_dir / 'training_history.png')
@@ -65,7 +66,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("Training complete!")
-    print(f"Model saved to: {checkpoint_dir / 'best_model.pkl'}")
+    print(f"Model saved to: {checkpoint_dir / 'best_model'}")
     print("=" * 60)
 
 
