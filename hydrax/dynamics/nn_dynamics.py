@@ -262,65 +262,104 @@ class NeuralNetworkDynamics(DynamicsModel):
         history_dim = self.state_dim + action_dim
         return jnp.zeros((self.history_length, history_dim))
 
-    def _update_qpos_from_delta(
-        self, current_qpos: jax.Array, delta: jax.Array
+    def _apply_delta_to_transformed_qpos(
+        self, current_qpos_transformed: jax.Array, delta: jax.Array
     ) -> jax.Array:
-        """Update qpos from predicted delta, handling angle updates properly.
+        """Apply delta to transformed qpos using trigonometric addition for angles.
 
-        For angles: network predicts (cos(delta), sin(delta)). We extract the
-        delta angle using arctan2, add it to the current angle, and normalize
-        to [-pi, pi] range.
+        This matches the training logic where deltas are applied in transformed space.
+        For angles represented as (cos, sin), use trig addition formulas:
+            cos(θ + δ) = cos(θ)cos(δ) - sin(θ)sin(δ)
+            sin(θ + δ) = sin(θ)cos(δ) + cos(θ)sin(δ)
 
         Args:
-            current_qpos: Original qpos (not transformed)
-            delta: Predicted delta from network (in transformed space)
+            current_qpos_transformed: Current qpos in transformed space (angles as cos/sin)
+            delta: Predicted delta in transformed space
 
         Returns:
-            Updated qpos in original space
+            Updated qpos in transformed space
         """
         if len(self.sorted_angle_indices) == 0:
             # No angles, simple addition
-            return current_qpos + delta
+            return current_qpos_transformed + delta
 
-        # Build updated qpos by processing each segment
-        new_qpos = current_qpos.copy()
+        # Build next_qpos by processing each segment
+        next_qpos_parts = []
         transformed_idx = 0
         original_idx = 0
 
-        # Use pre-sorted Python list to avoid JAX tracing issues
         for angle_idx in self.sorted_angle_indices:
-
-            # Skip to this angle in the transformed space
-            segment_length = angle_idx - original_idx
-            transformed_idx += segment_length
-
             # Update regular positions before this angle
+            segment_length = angle_idx - original_idx
             if segment_length > 0:
-                new_qpos = new_qpos.at[original_idx:angle_idx].add(
-                    delta[transformed_idx - segment_length:transformed_idx]
+                next_qpos_parts.append(
+                    current_qpos_transformed[transformed_idx:transformed_idx + segment_length] +
+                    delta[transformed_idx:transformed_idx + segment_length]
                 )
+                transformed_idx += segment_length
 
-            # Update the angle
-            # Delta is (cos(δ), sin(δ)) - extract angle delta using arctan2
+            # Update angle using trigonometric addition
+            # Current: (cos_θ, sin_θ), Delta: (cos_δ, sin_δ)
+            cos_theta = current_qpos_transformed[transformed_idx]
+            sin_theta = current_qpos_transformed[transformed_idx + 1]
             cos_delta = delta[transformed_idx]
             sin_delta = delta[transformed_idx + 1]
-            angle_delta = jnp.arctan2(sin_delta, cos_delta)
 
-            # Add delta to current angle and normalize to [-pi, pi]
-            new_angle = current_qpos[angle_idx] + angle_delta
-            # Normalize to [-pi, pi] range
-            new_angle = jnp.arctan2(jnp.sin(new_angle), jnp.cos(new_angle))
-            new_qpos = new_qpos.at[angle_idx].set(new_angle)
+            # Next angle: cos(θ + δ), sin(θ + δ)
+            cos_next = cos_theta * cos_delta - sin_theta * sin_delta
+            sin_next = sin_theta * cos_delta + cos_theta * sin_delta
 
-            transformed_idx += 2  # Skip the cos/sin pair
+            next_qpos_parts.append(jnp.array([cos_next, sin_next]))
+
+            transformed_idx += 2
             original_idx = angle_idx + 1
 
-        # Handle remaining positions after last angle
-        if original_idx < len(current_qpos):
-            remaining_length = len(current_qpos) - original_idx
-            new_qpos = new_qpos.at[original_idx:].add(delta[transformed_idx:transformed_idx + remaining_length])
+        # Update remaining positions after last angle
+        if transformed_idx < len(current_qpos_transformed):
+            next_qpos_parts.append(
+                current_qpos_transformed[transformed_idx:] + delta[transformed_idx:]
+            )
 
-        return new_qpos
+        return jnp.concatenate(next_qpos_parts)
+
+    def _transform_qpos_to_original(self, qpos_transformed: jax.Array) -> jax.Array:
+        """Convert transformed qpos (with cos/sin for angles) back to original space.
+
+        Args:
+            qpos_transformed: qpos in transformed space (angles as cos/sin pairs)
+
+        Returns:
+            qpos in original space (angles as single values)
+        """
+        if len(self.sorted_angle_indices) == 0:
+            return qpos_transformed
+
+        # Build original qpos by converting cos/sin back to angles
+        parts = []
+        transformed_idx = 0
+        original_idx = 0
+
+        for angle_idx in self.sorted_angle_indices:
+            # Add regular positions before this angle
+            segment_length = angle_idx - original_idx
+            if segment_length > 0:
+                parts.append(qpos_transformed[transformed_idx:transformed_idx + segment_length])
+                transformed_idx += segment_length
+
+            # Convert (cos, sin) back to angle using arctan2
+            cos_val = qpos_transformed[transformed_idx]
+            sin_val = qpos_transformed[transformed_idx + 1]
+            angle = jnp.arctan2(sin_val, cos_val)
+            parts.append(jnp.array([angle]))
+
+            transformed_idx += 2
+            original_idx = angle_idx + 1
+
+        # Add remaining positions after last angle
+        if transformed_idx < len(qpos_transformed):
+            parts.append(qpos_transformed[transformed_idx:])
+
+        return jnp.concatenate(parts)
 
     def _normalize_qvel(self, qvel: jax.Array) -> jax.Array:
         """Normalize velocities to [-1, 1] range.
@@ -402,16 +441,20 @@ class NeuralNetworkDynamics(DynamicsModel):
         delta_qpos = delta[:self.transformed_qpos_dim]
         delta_qvel_normalized = delta[self.transformed_qpos_dim:]
 
-        # Update qpos (handling angles with arctan2 and normalization)
-        new_qpos = self._update_qpos_from_delta(data.qpos, delta_qpos)
+        # Get the last state from history (in transformed space with normalized qvel)
+        # This is the state the network used to make the prediction
+        last_state_transformed = updated_history[-1, :self.transformed_qpos_dim + model.nv]
+        last_qpos_transformed = last_state_transformed[:self.transformed_qpos_dim]
+        last_qvel_normalized = last_state_transformed[self.transformed_qpos_dim:]
 
-        # Denormalize qvel delta and update qvel
-        # The network predicts delta in normalized space, so we need to:
-        # 1. Get current normalized qvel
-        # 2. Add the predicted delta (in normalized space)
-        # 3. Denormalize back to original space
-        current_qvel_normalized = self._normalize_qvel(data.qvel)
-        new_qvel_normalized = current_qvel_normalized + delta_qvel_normalized
+        # Apply delta to transformed qpos using trigonometric addition for angles
+        new_qpos_transformed = self._apply_delta_to_transformed_qpos(last_qpos_transformed, delta_qpos)
+
+        # Convert transformed qpos back to original space
+        new_qpos = self._transform_qpos_to_original(new_qpos_transformed)
+
+        # Update qvel in normalized space and denormalize
+        new_qvel_normalized = last_qvel_normalized + delta_qvel_normalized
         new_qvel = self._denormalize_qvel(new_qvel_normalized)
 
         # Create new data object with updated state
