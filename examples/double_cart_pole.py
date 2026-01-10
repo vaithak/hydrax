@@ -1,12 +1,14 @@
 import mujoco
 
-from hydrax.algs import PredictiveSampling, MPPI
+from hydrax.algs import PredictiveSampling, MPPI, DIAL
 from hydrax.simulation.deterministic import run_interactive
 from hydrax.tasks.double_cart_pole import DoubleCartPole
 from hydrax.dynamics import NeuralNetworkDynamics
 
 import argparse
 import jax.numpy as jnp
+from pathlib import Path
+from hydrax import ROOT
 
 """
 Run an interactive simulation of a double pendulum on a cart. Only the cart
@@ -22,6 +24,7 @@ subparsers = parser.add_subparsers(
 )
 subparsers.add_parser("ps", help="Predictive Sampling")
 subparsers.add_parser("mppi", help="Model Predictive Path Integral Control")
+subparsers.add_parser("dial", help="Diffusion-Inspired Annealing for Legged MPC")
 
 # Add dynamics model argument
 parser.add_argument(
@@ -49,18 +52,28 @@ base_task = DoubleCartPole()
 custom_dynamics = None
 if args.dynamics == "nn":
     print("Using Neural Network (GRU) dynamics for rollouts")
-    # For double cart pole:
-    # qpos[0]: cart position (coordinate)
-    # qpos[1]: pole 1 angle
-    # qpos[2]: pole 2 angle
-    # So we normalize cart position (index 0) and convert angles (indices 1, 2) to (cos, sin)
-    custom_dynamics = NeuralNetworkDynamics(
-        model=base_task.model,
-        hidden_size=128,
-        history_length=11,
-        coordinate_indices=jnp.array([0]),
-        angle_indices=jnp.array([1, 2]),
-    )
+
+    # Path to the best trained model checkpoint
+    checkpoint_path = Path(ROOT) / 'data_csv' / 'dynamics_model_training' / 'checkpoints' / 'double_cart_pole' / 'best_model'
+
+    if checkpoint_path.exists():
+        print(f"Loading trained model from: {checkpoint_path}")
+        custom_dynamics = NeuralNetworkDynamics.load_from_checkpoint(
+            model=base_task.model,
+            checkpoint_dir=str(checkpoint_path)
+        )
+        print("Successfully loaded trained dynamics model!")
+    else:
+        print(f"Warning: Trained checkpoint not found at {checkpoint_path}")
+        print("Initializing untrained Neural Network (GRU) dynamics model instead")
+        # Fallback to untrained model with same architecture as training
+        custom_dynamics = NeuralNetworkDynamics(
+            model=base_task.model,
+            hidden_size=128,
+            history_length=11,
+            coordinate_indices=jnp.array([0]),
+            angle_indices=jnp.array([1, 2]),
+        )
 else:
     print("Using default MJX dynamics for rollouts")
 
@@ -88,6 +101,20 @@ elif args.algorithm == "mppi":
         spline_type="cubic",
         plan_horizon=1.0,
         num_knots=4,
+    )
+elif args.algorithm == "dial":
+    print("Running DIAL")
+    ctrl = DIAL(
+        task,
+        num_samples=1024,
+        noise_level=0.3,
+        beta_opt_iter=1.0,
+        beta_horizon=1.0,
+        temperature=0.1,
+        spline_type="cubic",
+        plan_horizon=0.8,
+        num_knots=4,
+        iterations=3,
     )
 
 # Define the model used for simulation
