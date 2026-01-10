@@ -1,6 +1,6 @@
 import mujoco
 
-from hydrax.algs import PredictiveSampling, MPPI
+from hydrax.algs import PredictiveSampling, MPPI, DIAL
 from hydrax.simulation.deterministic import run_interactive
 from hydrax.tasks.double_cart_pole import DoubleCartPole
 from hydrax.dynamics import NeuralNetworkDynamics
@@ -24,6 +24,7 @@ subparsers = parser.add_subparsers(
 )
 subparsers.add_parser("ps", help="Predictive Sampling")
 subparsers.add_parser("mppi", help="Model Predictive Path Integral Control")
+subparsers.add_parser("dial", help="Diffusion-Inspired Annealing for Legged MPC")
 
 # Add dynamics model argument
 parser.add_argument(
@@ -100,6 +101,20 @@ elif args.algorithm == "mppi":
         spline_type="cubic",
         plan_horizon=1.0,
         num_knots=4,
+    )
+elif args.algorithm == "dial":
+    print("Running DIAL")
+    ctrl = DIAL(
+        task,
+        num_samples=1024,
+        noise_level=0.3,
+        beta_opt_iter=1.0,
+        beta_horizon=1.0,
+        temperature=0.1,
+        spline_type="cubic",
+        plan_horizon=0.8,
+        num_knots=4,
+        iterations=3,
     )
 
 # Define the model used for simulation
